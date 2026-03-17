@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>SimpleLocator — Geospatial Index Demo</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <link rel="stylesheet" th:href="@{/css/style.css}"/>
+</head>
+<body>
+
+<!-- ═══════════════════════════  HEADER  ════════════════════════════════ -->
+<header class="site-header">
+    <div class="header-inner">
+        <div class="header-title">
+            <span class="header-icon">📍</span>
+            <div>
+                <h1>SimpleLocator</h1>
+                <p>Geospatial Index Explorer — PostGIS + Spring Boot</p>
+            </div>
+        </div>
+        <div class="header-badge">
+            <span class="db-badge">PostgreSQL 16</span>
+            <span class="db-badge postgis">PostGIS 3.4</span>
+        </div>
+    </div>
+</header>
+
+<!-- ═══════════════════════════  SEARCH  ════════════════════════════════ -->
+<section class="search-section">
+    <div class="container">
+        <div class="search-card">
+            <h2>Find Restaurants Within <span class="highlight">5 Miles</span></h2>
+            <p class="search-sub">Enter your location — see how GiST, SP-GiST and Geohash indexes answer the same query.</p>
+
+            <div class="search-form">
+                <div class="coord-group">
+                    <label for="latitude">Latitude</label>
+                    <input type="number" id="latitude"  value="40.7128" step="0.0001" min="-90"  max="90"/>
+                </div>
+                <div class="coord-group">
+                    <label for="longitude">Longitude</label>
+                    <input type="number" id="longitude" value="-74.0060" step="0.0001" min="-180" max="180"/>
+                </div>
+                <button class="btn-search" id="searchBtn" onclick="runSearch()">
+                    <span class="btn-icon">🔍</span> Search
+                </button>
+            </div>
+
+            <div class="quick-locations">
+                <span class="ql-label">Quick:</span>
+                <button class="ql-btn" onclick="setLocation(40.7128,-74.0060)">📍 Lower Manhattan</button>
+                <button class="ql-btn" onclick="setLocation(40.7580,-73.9855)">📍 Times Square</button>
+                <button class="ql-btn" onclick="setLocation(40.6892,-74.0445)">📍 Statue of Liberty</button>
+                <button class="ql-btn" onclick="setLocation(40.7282,-73.7949)">📍 JFK Airport</button>
+            </div>
+
+            <div class="db-stats">
+                🗄️ Database loaded with <strong th:text="${totalRestaurants}">?</strong> NYC-area restaurants
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════  HOW IT WORKS  ══════════════════════════ -->
+<section class="concepts-section">
+    <div class="container">
+        <h2 class="section-title">How Each Index Works</h2>
+        <p class="section-sub">Same query — three completely different data structures</p>
+
+        <div class="concepts-grid">
+
+            <!-- GiST card -->
+            <div class="concept-card gist">
+                <div class="concept-header">
+                    <div class="index-badge gist-badge">GiST</div>
+                    <div><div class="index-name">R-tree</div><div class="index-type">Generalized Search Tree</div></div>
+                </div>
+                <div class="viz-box">
+                    <div class="rtree-root">
+                        <span class="mbr-label">Root MBR</span>
+                        <div class="rtree-row">
+                            <div class="mbr mbr-a"><span class="mbr-label small">Manhattan</span>
+                                <div class="pts-row">
+                                    <div class="pt gist-pt" title="Joe's Pizza">J</div>
+                                    <div class="pt gist-pt" title="Le Bernardin">L</div>
+                                    <div class="pt gist-pt" title="Nobu">N</div>
+                                </div>
+                            </div>
+                            <div class="mbr mbr-b"><span class="mbr-label small">Brooklyn</span>
+                                <div class="pts-row">
+                                    <div class="pt gist-pt" title="Peter Luger">P</div>
+                                    <div class="pt gist-pt" title="Grimaldi's">G</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="viz-caption">Hierarchical Minimum Bounding Rectangles</div>
+                </div>
+                <ul class="concept-points">
+                    <li>Geometries grouped into <strong>overlapping bounding rectangles</strong></li>
+                    <li><code>ST_DWithin()</code> walks the tree — prunes branches whose MBR can't intersect the circle</li>
+                    <li>Best <strong>all-around</strong> spatial index</li>
+                </ul>
+                <div class="sql-block"><div class="sql-label">SQL Pattern</div>
+<pre>WHERE ST_DWithin(
+  CAST(location_gist AS geography),
+  CAST(ST_MakePoint(lng,lat) AS geography),
+  8046.72  -- 5 miles in metres
+)</pre></div>
+            </div>
+
+            <!-- SP-GiST card -->
+            <div class="concept-card spgist">
+                <div class="concept-header">
+                    <div class="index-badge spgist-badge">SP-GiST</div>
+                    <div><div class="index-name">Quadtree</div><div class="index-type">Space-Partitioning GiST</div></div>
+                </div>
+                <div class="viz-box">
+                    <div class="quadtree-grid">
+                        <div class="quad q-nw"><span class="q-label">NW</span><div class="pt spgist-pt">·</div></div>
+                        <div class="quad q-ne"><span class="q-label">NE</span><div class="pt spgist-pt">·</div><div class="pt spgist-pt">·</div></div>
+                        <div class="quad q-sw"><span class="q-label">SW</span></div>
+                        <div class="quad q-se"><span class="q-label">SE ↓</span>
+                            <div class="sub-grid">
+                                <div class="sub-q active">·</div><div class="sub-q">·</div>
+                                <div class="sub-q"></div><div class="sub-q"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="viz-caption">Space split into non-overlapping quadrants</div>
+                </div>
+                <ul class="concept-points">
+                    <li>Space <strong>recursively divided into 4 equal quadrants</strong> — no overlapping MBRs</li>
+                    <li><code>&amp;&amp;</code> operator activates index; <code>ST_Expand</code> builds the envelope</li>
+                    <li>Excellent for <strong>uniformly distributed</strong> data</li>
+                </ul>
+                <div class="sql-block"><div class="sql-label">SQL Pattern</div>
+<pre>WHERE location_spgist
+  &amp;&amp; ST_Expand(ST_MakePoint(lng,lat), 0.09)
+AND ST_DWithin(
+  CAST(location_spgist AS geography),
+  ..., 8046.72
+)</pre></div>
+            </div>
+
+            <!-- Geohash card -->
+            <div class="concept-card geohash">
+                <div class="concept-header">
+                    <div class="index-badge geohash-badge">Geohash</div>
+                    <div><div class="index-name">B-tree</div><div class="index-type">String Prefix Index</div></div>
+                </div>
+                <div class="viz-box">
+                    <div class="geohash-grid">
+                        <div class="gh-cell neighbor">dr5p</div><div class="gh-cell neighbor">dr5r</div><div class="gh-cell neighbor">dr5x</div>
+                        <div class="gh-cell neighbor">dr5n</div><div class="gh-cell center">dr5q ★</div><div class="gh-cell neighbor">dr5w</div>
+                        <div class="gh-cell neighbor">dr5j</div><div class="gh-cell neighbor">dr5m</div><div class="gh-cell neighbor">dr5t</div>
+                    </div>
+                    <div class="viz-caption">Center cell + 8 neighbors searched by prefix</div>
+                </div>
+                <ul class="concept-points">
+                    <li>Lat/lng encoded as <strong>base-32 string</strong> — nearby places share common prefixes</li>
+                    <li>9 cells via <code>LIKE 'dr5q%'</code>; <code>ST_DWithin</code> removes corner false-positives</li>
+                    <li>Works in <strong>any store</strong> — Redis, DynamoDB, MySQL</li>
+                </ul>
+                <div class="sql-block"><div class="sql-label">SQL Pattern</div>
+<pre>WHERE (geohash LIKE 'dr5q%'
+   OR  geohash LIKE 'dr5r%' OR …)
+AND ST_DWithin(..., 8046.72)</pre></div>
+            </div>
+
+        </div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════  RESULTS  ═══════════════════════════════ -->
+<section class="results-section" id="resultsSection" style="display:none">
+    <div class="container">
+        <div class="loading" id="loading">
+            <div class="spinner"></div><p>Querying all three indexes…</p>
+        </div>
+        <div id="resultsContent" style="display:none">
+            <div class="timing-bar-section">
+                <h3>Execution Time Comparison</h3>
+                <div class="timing-bars" id="timingBars"></div>
+            </div>
+            <div class="results-grid">
+                <div class="result-col gist-col">
+                    <div class="result-header gist-header">
+                        <span class="r-badge gist-badge">GiST</span>
+                        <span class="r-index-name">R-tree Index</span>
+                        <span class="r-count" id="gistCount">—</span>
+                    </div>
+                    <div class="r-timing" id="gistTiming">—</div>
+                    <ul class="r-list" id="gistList"></ul>
+                </div>
+                <div class="result-col spgist-col">
+                    <div class="result-header spgist-header">
+                        <span class="r-badge spgist-badge">SP-GiST</span>
+                        <span class="r-index-name">Quadtree Index</span>
+                        <span class="r-count" id="spgistCount">—</span>
+                    </div>
+                    <div class="r-timing" id="spgistTiming">—</div>
+                    <ul class="r-list" id="spgistList"></ul>
+                </div>
+                <div class="result-col geohash-col">
+                    <div class="result-header geohash-header">
+                        <span class="r-badge geohash-badge">Geohash</span>
+                        <span class="r-index-name">B-tree Index</span>
+                        <span class="r-count" id="geohashCount">—</span>
+                    </div>
+                    <div class="r-timing" id="geohashTiming">—</div>
+                    <ul class="r-list" id="geohashList"></ul>
+                </div>
+            </div>
+            <p class="results-note">
+                ✅ All three indexes return the <strong>same restaurants</strong> — they differ only in
+                <em>how</em> they find them. Scroll down to see the live map visualization.
+            </p>
+        </div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════  MAP VISUALIZATION  ════════════════════ -->
+<section class="viz-section" id="vizSection" style="display:none">
+    <div class="container">
+        <h2 class="section-title">Live Index Visualization</h2>
+        <p class="section-sub">Watch how each index navigates your actual data on the map</p>
+
+        <div class="viz-loading" id="vizLoading">
+            <div class="spinner"></div><p>Building map visualizations…</p>
+        </div>
+
+        <div id="vizContent" style="display:none">
+
+            <!-- Tab nav -->
+            <div class="viz-tab-nav">
+                <button class="viz-tab-btn active" id="tab-gist"    onclick="showVizTab('gist')">
+                    <span class="tab-badge gist-badge">GiST</span> R-tree Traversal
+                </button>
+                <button class="viz-tab-btn" id="tab-spgist"  onclick="showVizTab('spgist')">
+                    <span class="tab-badge spgist-badge">SP-GiST</span> Quadtree Filter
+                </button>
+                <button class="viz-tab-btn" id="tab-geohash" onclick="showVizTab('geohash')">
+                    <span class="tab-badge geohash-badge">Geohash</span> Cell Prefix Search
+                </button>
+            </div>
+
+            <!-- ── GiST panel ──────────────────────────────────────── -->
+            <div class="viz-panel" id="viz-gist">
+                <div class="viz-layout">
+                    <div id="map-gist" class="map-container"></div>
+                    <div class="viz-legend">
+                        <h4>GiST (R-tree) Traversal</h4>
+                        <div class="leg-item"><span class="l-rect" style="border:2px solid #3b82f6"></span> Searched MBR</div>
+                        <div class="leg-item"><span class="l-rect dashed" style="border:2px dashed #94a3b8"></span> Pruned MBR</div>
+                        <div class="leg-item"><span class="l-dot" style="background:#2563eb"></span> Within 5 miles (result)</div>
+                        <div class="leg-item"><span class="l-dot" style="background:#94a3b8"></span> Outside radius</div>
+                        <div class="leg-item"><span class="l-circle-sm"></span> 5-mile search circle</div>
+                        <div class="viz-explain">
+                            <strong>What's happening:</strong> The R-tree groups restaurants into 4 colored MBRs.
+                            Solid-border MBRs <em>intersect</em> the search circle — the planner descends into them.
+                            Dashed MBRs are <em>pruned</em> without ever reading their contents.
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ── SP-GiST panel ───────────────────────────────────── -->
+            <div class="viz-panel" id="viz-spgist" style="display:none">
+                <div class="viz-layout">
+                    <div id="map-spgist" class="map-container"></div>
+                    <div class="viz-legend">
+                        <h4>SP-GiST (Quadtree) Filter</h4>
+                        <div class="leg-item"><span class="l-rect" style="border:2px solid #f59e0b;background:rgba(245,158,11,.12)"></span> ST_Expand bbox</div>
+                        <div class="leg-item"><span class="l-dot" style="background:#16a34a"></span> In circle (result)</div>
+                        <div class="leg-item"><span class="l-dot" style="background:#f59e0b"></span> In bbox, filtered by ST_DWithin</div>
+                        <div class="leg-item"><span class="l-dot" style="background:#94a3b8"></span> Outside bbox — pruned</div>
+                        <div class="leg-item"><span class="l-circle-sm"></span> 5-mile search circle</div>
+                        <div class="viz-explain">
+                            <strong>Two-phase filter:</strong> The yellow rectangle is <code>ST_Expand(center, 0.09°)</code>.
+                            SP-GiST only reads quadrant nodes overlapping that box.
+                            Yellow dots were fetched but discarded by the exact <code>ST_DWithin</code> check.
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ── Geohash panel ───────────────────────────────────── -->
+            <div class="viz-panel" id="viz-geohash" style="display:none">
+                <div class="viz-layout">
+                    <div id="map-geohash" class="map-container"></div>
+                    <div class="viz-legend">
+                        <h4>Geohash Cell Search</h4>
+                        <div class="leg-item"><span class="l-rect" style="border:2px solid #ea580c;background:rgba(234,88,12,.25)"></span> Center cell</div>
+                        <div class="leg-item"><span class="l-rect" style="border:2px solid #f97316;background:rgba(249,115,22,.1)"></span> Neighbor cells (×8)</div>
+                        <div class="leg-item"><span class="l-dot" style="background:#16a34a"></span> In cell + in circle (result)</div>
+                        <div class="leg-item"><span class="l-dot" style="background:#f59e0b"></span> In cell, filtered by ST_DWithin</div>
+                        <div class="leg-item"><span class="l-dot" style="background:#94a3b8"></span> Not in any search cell</div>
+                        <div class="leg-item"><span class="l-circle-sm"></span> 5-mile search circle</div>
+                        <div class="viz-explain">
+                            <strong>Prefix scan:</strong> The 9 cells are searched via
+                            <code>LIKE 'xxxx%'</code> on the B-tree. Only restaurants
+                            whose geohash starts with one of these 9 prefixes are read.
+                            Yellow dots are in cells but outside the circle — removed by <code>ST_DWithin</code>.
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div><!-- /vizContent -->
+    </div>
+</section>
+
+<!-- ═══════════════════════  QUERY FLOW  ════════════════════════════════ -->
+<section class="flow-section">
+    <div class="container">
+        <h2 class="section-title">Query Flow</h2>
+        <p class="section-sub">What PostgreSQL does internally for each index</p>
+        <div class="flow-grid">
+            <div class="flow-card">
+                <div class="flow-title"><span class="index-badge gist-badge">GiST</span> R-tree Path</div>
+                <ol class="flow-steps">
+                    <li>Receive <code>ST_DWithin(location, center, 8047m)</code></li>
+                    <li>Walk R-tree root → skip branches whose MBR &gt; 8 km from center</li>
+                    <li>At leaf nodes → exact distance check</li>
+                    <li>Return matched rows ordered by distance</li>
+                </ol>
+            </div>
+            <div class="flow-card">
+                <div class="flow-title"><span class="index-badge spgist-badge">SP-GiST</span> Quadtree Path</div>
+                <ol class="flow-steps">
+                    <li>Build envelope: <code>ST_Expand(center, 0.09°)</code></li>
+                    <li><code>&amp;&amp;</code> → SP-GiST descends only quadrants overlapping the box</li>
+                    <li>Collect candidate rows from matching leaf quadrants</li>
+                    <li><code>ST_DWithin</code> exact filter → discard box corners</li>
+                </ol>
+            </div>
+            <div class="flow-card">
+                <div class="flow-title"><span class="index-badge geohash-badge">Geohash</span> B-tree Path</div>
+                <ol class="flow-steps">
+                    <li>Encode center → geohash precision-4 string</li>
+                    <li>Compute 8 neighboring cells → 9 prefix strings</li>
+                    <li>B-tree scan: <code>LIKE 'dr5q%' OR LIKE 'dr5r%' OR…</code></li>
+                    <li><code>ST_DWithin</code> exact filter → remove rectangle corners</li>
+                </ol>
+            </div>
+        </div>
+    </div>
+</section>
+
+<footer class="site-footer">
+    <div class="container">
+        <p>SimpleLocator · Spring Boot 3.2 · PostgreSQL 16 · PostGIS 3.4 · Hibernate Spatial 6.4</p>
+        <p class="footer-sub">pgAdmin → <code>http://localhost:5050</code> &nbsp;|&nbsp; REST → <code>/api/restaurants/search/compare</code></p>
+    </div>
+</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script th:src="@{/js/app.js}"></script>
+</body>
+</html>
