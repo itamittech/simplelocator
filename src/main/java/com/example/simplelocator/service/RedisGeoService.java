@@ -8,7 +8,6 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
-import org.springframework.data.geo.Circle;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
 import org.springframework.data.geo.GeoResults;
@@ -18,6 +17,8 @@ import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.connection.RedisGeoCommands.GeoLocation;
 import org.springframework.data.redis.core.GeoOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.domain.geo.GeoReference;
+import org.springframework.data.redis.domain.geo.RadiusShape;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -87,10 +88,11 @@ public class RedisGeoService {
         try {
             GeoOperations<String, String> geo = stringRedisTemplate.opsForGeo();
 
-            GeoResults<GeoLocation<String>> results = geo.radius(
+            GeoResults<GeoLocation<String>> results = geo.search(
                     GEO_KEY,
-                    new Circle(new Point(lng, lat), new Distance(radiusMiles, Metrics.MILES)),
-                    RedisGeoCommands.GeoRadiusCommandArgs.newGeoRadiusArgs()
+                    GeoReference.fromCoordinate(new Point(lng, lat)),
+                    new RadiusShape(new Distance(radiusMiles, Metrics.MILES)),
+                    RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs()
                             .includeDistance()
                             .sortAscending()
                             .limit(20)

@@ -382,9 +382,9 @@ AND ST_DWithin(..., 8046.72)</pre></div>
                 </div>
                 <ul class="concept-points">
                     <li>All 23 restaurants loaded via <code>GEOADD</code> on app startup</li>
-                    <li><code>GEORADIUS</code> scans sorted-set scores within a radius — no SQL, no geometry types</li>
+                    <li><code>GEOSEARCH</code> (Redis 6.2+) replaces deprecated <code>GEORADIUS</code> — same O(log N) scan</li>
                     <li>Sub-millisecond for small datasets; ideal for <strong>high-frequency location updates</strong></li>
-                    <li>Works alongside any primary database — Redis is the <strong>fast proximity layer</strong></li>
+                    <li>Works alongside PostGIS — Redis for <strong>fast proximity</strong>, PostGIS for <strong>geofencing</strong></li>
                 </ul>
                 <div class="sql-block">
                     <div class="sql-label">Redis Commands</div>
@@ -392,25 +392,27 @@ AND ST_DWithin(..., 8046.72)</pre></div>
 GEOADD restaurants:geo lng lat "id" …
 
 # Query on every rider location update
-GEORADIUS restaurants:geo lng lat 2 mi
-  ASC WITHDIST COUNT 20</pre>
+GEOSEARCH restaurants:geo
+  FROMLONLAT lng lat
+  BYRADIUS 2 mi
+  ASC WITHCOORD WITHDIST COUNT 20</pre>
                 </div>
             </div>
 
             <div class="flow-card redis-flow-card">
-                <div class="flow-title"><span class="index-badge redis-badge" style="width:auto;padding:4px 10px">Redis</span> Query Flow</div>
+                <div class="flow-title"><span class="index-badge redis-badge" style="width:auto;padding:4px 10px">Redis + PostGIS</span> Hybrid Query Flow</div>
                 <ol class="flow-steps">
-                    <li>App starts → <code>GEOADD</code> loads all 23 restaurants into a single sorted set</li>
-                    <li>Rider location changes → POST <code>/api/rider/nearby</code> with lat/lng</li>
-                    <li>Spring calls <code>GEORADIUS key lng lat 2 mi ASC WITHDIST</code></li>
-                    <li>Redis scans geohash scores within the 2-mile band — pure in-memory</li>
-                    <li>Results returned with distance in miles, sorted nearest-first</li>
-                    <li>No PostGIS, no geometry columns, no SQL at query time</li>
+                    <li>App starts → <code>GEOADD</code> loads all restaurants into a Redis sorted set</li>
+                    <li>Rider moves → POST <code>/api/rider/update</code> with lat/lng</li>
+                    <li>Redis <code>GEOSEARCH FROMLONLAT … BYRADIUS 2 mi</code> → list of nearby IDs</li>
+                    <li>PostGIS <code>ST_Within(point, zone.boundary)</code> → current delivery zone</li>
+                    <li>Zone change or close restaurant detected → SSE event pushed to browser</li>
+                    <li>Browser receives event via <code>EventSource</code> — no polling needed</li>
                 </ol>
                 <div class="redis-vs">
-                    <div class="vs-row"><span class="vs-label">vs PostGIS GiST</span><span class="vs-val">No disk I/O — all in RAM</span></div>
-                    <div class="vs-row"><span class="vs-label">Trade-off</span><span class="vs-val">No complex spatial ops (polygons, intersects)</span></div>
-                    <div class="vs-row"><span class="vs-label">Best for</span><span class="vs-val">Continuous location tracking, real-time apps</span></div>
+                    <div class="vs-row"><span class="vs-label">Redis</span><span class="vs-val">Fast proximity — all in RAM, no SQL</span></div>
+                    <div class="vs-row"><span class="vs-label">PostGIS</span><span class="vs-val">Geofencing — polygon containment (ST_Within)</span></div>
+                    <div class="vs-row"><span class="vs-label">SSE</span><span class="vs-val">Push events — no client polling</span></div>
                 </div>
             </div>
         </div>
@@ -427,6 +429,10 @@ GEORADIUS restaurants:geo lng lat 2 mi
                 </select>
             </div>
             <div class="rider-pos" id="riderPos">📍 awaiting start…</div>
+            <div class="zone-display">
+                <span class="zone-label">Zone:</span>
+                <span class="zone-badge" id="riderZone">—</span>
+            </div>
             <div class="rider-cmd" id="riderCmd" style="display:none">
                 <code id="riderCmdText"></code>
             </div>
@@ -448,13 +454,31 @@ GEORADIUS restaurants:geo lng lat 2 mi
             </div>
         </div>
 
+        <!-- SSE Event Log -->
+        <div class="event-log-panel">
+            <div class="event-log-header">
+                <span class="sse-badge">SSE</span>
+                <span class="event-log-title">Live Event Stream</span>
+                <span class="event-log-sub">Server-Sent Events — no polling, pure push</span>
+            </div>
+            <div class="event-log-legend">
+                <span class="leg-ev enter">🟢 GEOFENCE_ENTER</span>
+                <span class="leg-ev exit">🔴 GEOFENCE_EXIT</span>
+                <span class="leg-ev assign">⭐ RIDER_ASSIGNED</span>
+                <span class="leg-ev unassign">⬜ RIDER_UNASSIGNED</span>
+            </div>
+            <div class="event-log" id="eventLog">
+                <div class="ev-empty">Events will appear here once the rider starts…</div>
+            </div>
+        </div>
+
     </div>
 </section>
 
 <footer class="site-footer">
     <div class="container">
         <p>SimpleLocator · Spring Boot 3.2 · PostgreSQL 16 · PostGIS 3.4 · Redis 7 · Hibernate Spatial 6.4</p>
-        <p class="footer-sub">pgAdmin → <code>http://localhost:5050</code> &nbsp;|&nbsp; REST → <code>/api/restaurants/search/compare</code> &nbsp;|&nbsp; Rider → <code>/api/rider/nearby</code></p>
+        <p class="footer-sub">pgAdmin → <code>http://localhost:5050</code> &nbsp;|&nbsp; REST → <code>/api/restaurants/search/compare</code> &nbsp;|&nbsp; Rider → <code>/api/rider/update</code> &nbsp;|&nbsp; SSE → <code>/api/rider/stream</code></p>
     </div>
 </footer>
 

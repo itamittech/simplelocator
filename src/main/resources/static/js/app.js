@@ -307,8 +307,9 @@ const RIDER_ROUTE = [
     [40.7711, -73.9820],  // 59th St / Central Park South
 ];
 
-const STEPS_PER_SEG = 12;   // interpolation steps between waypoints
-const RADIUS_MILES  = 2.0;  // fixed 2-mile search radius
+const STEPS_PER_SEG  = 12;   // interpolation steps between waypoints
+const RADIUS_MILES   = 2.0;  // fixed 2-mile search radius
+const RIDER_ID       = 'rider-1';
 
 let riderMap        = null;
 let riderMarker     = null;
@@ -318,7 +319,11 @@ let riderInterval   = null;
 let riderRunning    = false;
 let riderSeg        = 0;
 let riderStep       = 0;
-const riderAllMarkers = new Map();  // id → L.circleMarker (all 23 restaurants)
+let riderSseSource  = null;           // EventSource for SSE
+let currentAssignedId = null;         // currently assigned restaurant id
+const riderAllMarkers = new Map();    // id → L.circleMarker (all restaurants)
+const riderZoneLayers = [];           // zone rectangles on the map
+const eventLog        = [];           // event log entries (most recent first)
 
 /** Interpolate position along the route */
 function getRiderPos() {
@@ -336,6 +341,115 @@ function advanceRiderPos() {
     }
 }
 
+// ── Zone initialization ───────────────────────────────────────────────────────
+
+async function initZones() {
+    try {
+        const resp = await fetch('/api/rider/zones');
+        if (!resp.ok) return;
+        const zones = await resp.json();
+        zones.forEach(z => {
+            const rect = L.rectangle(
+                [[z.minLat, z.minLng], [z.maxLat, z.maxLng]],
+                { color: z.color, weight: 2, fillColor: z.color, fillOpacity: 0.10, dashArray: '6 4' }
+            ).bindTooltip(`<b>${esc(z.name)}</b><br>Delivery Zone`, { sticky: true });
+            rect.addTo(riderMap);
+            riderZoneLayers.push({ zone: z, rect });
+        });
+    } catch (e) { console.warn('Could not load zones:', e); }
+}
+
+// ── SSE subscription ──────────────────────────────────────────────────────────
+
+function initSse() {
+    if (riderSseSource) return;          // already connected
+    riderSseSource = new EventSource('/api/rider/stream');
+
+    riderSseSource.addEventListener('LOCATION_UPDATE', e => {
+        // Silently received — map is already updated by riderTick()
+    });
+
+    riderSseSource.addEventListener('GEOFENCE_ENTER', e => {
+        const d = JSON.parse(e.data);
+        addEventLog('enter', `Entered zone: <strong>${esc(d.zone)}</strong>`);
+        highlightZone(d.zone, true);
+    });
+
+    riderSseSource.addEventListener('GEOFENCE_EXIT', e => {
+        const d = JSON.parse(e.data);
+        addEventLog('exit', `Left zone: <strong>${esc(d.zone)}</strong>`);
+        highlightZone(d.zone, false);
+    });
+
+    riderSseSource.addEventListener('RIDER_ASSIGNED', e => {
+        const d = JSON.parse(e.data);
+        addEventLog('assign',
+            `Assigned to <strong>${esc(d.restaurantName)}</strong> — ${d.distanceMiles} mi away`);
+        highlightAssigned(d.restaurantId);
+    });
+
+    riderSseSource.addEventListener('RIDER_UNASSIGNED', e => {
+        addEventLog('unassign', 'Assignment cleared — no restaurant within 0.5 mi');
+        highlightAssigned(null);
+    });
+
+    riderSseSource.onerror = () => {
+        // Connection drops when tab goes to background — will reconnect automatically
+    };
+}
+
+function highlightZone(zoneName, entering) {
+    riderZoneLayers.forEach(({ zone, rect }) => {
+        if (zone.name === zoneName) {
+            rect.setStyle({ fillOpacity: entering ? 0.30 : 0.10 });
+        }
+    });
+}
+
+function highlightAssigned(restaurantId) {
+    currentAssignedId = restaurantId;
+    riderAllMarkers.forEach((marker, id) => {
+        if (id === restaurantId) {
+            marker.setStyle({ fillColor: '#f59e0b', radius: 13, fillOpacity: 1.0 });
+        }
+    });
+}
+
+// ── Event log ─────────────────────────────────────────────────────────────────
+
+const EVENT_ICONS = {
+    enter:    { icon: '🟢', cls: 'ev-enter'    },
+    exit:     { icon: '🔴', cls: 'ev-exit'     },
+    assign:   { icon: '⭐', cls: 'ev-assign'   },
+    unassign: { icon: '⬜', cls: 'ev-unassign' },
+};
+
+function addEventLog(type, html) {
+    const ts = new Date().toLocaleTimeString();
+    eventLog.unshift({ type, html, ts });
+    if (eventLog.length > 40) eventLog.pop();
+    renderEventLog();
+}
+
+function renderEventLog() {
+    const el = document.getElementById('eventLog');
+    if (!el) return;
+    if (!eventLog.length) {
+        el.innerHTML = '<div class="ev-empty">Events will appear here once the rider starts…</div>';
+        return;
+    }
+    el.innerHTML = eventLog.map(ev => {
+        const { icon, cls } = EVENT_ICONS[ev.type] || { icon: '📌', cls: '' };
+        return `<div class="event-item ${cls}">
+          <span class="ev-icon">${icon}</span>
+          <span class="ev-body">${ev.html}</span>
+          <span class="ev-ts">${ev.ts}</span>
+        </div>`;
+    }).join('');
+}
+
+// ── Map init ──────────────────────────────────────────────────────────────────
+
 async function initRiderMap() {
     if (riderMap) return;
 
@@ -344,6 +458,9 @@ async function initRiderMap() {
         maxZoom: 19,
         attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
     }).addTo(riderMap);
+
+    // Delivery zones (drawn before restaurant dots so dots appear on top)
+    await initZones();
 
     // Dashed route line
     riderRouteLine = L.polyline(RIDER_ROUTE, {
@@ -381,6 +498,8 @@ async function initRiderMap() {
     } catch (e) { console.error('Could not pre-load restaurants:', e); }
 }
 
+// ── Rider tick ────────────────────────────────────────────────────────────────
+
 async function riderTick() {
     const [lat, lng] = getRiderPos();
     advanceRiderPos();
@@ -394,48 +513,66 @@ async function riderTick() {
     document.getElementById('riderPos').textContent =
         `📍 ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
 
-    // Show the exact Redis command being executed
+    // Show the exact Redis command being executed (GEOSEARCH — modern syntax)
     const cmdEl = document.getElementById('riderCmd');
     cmdEl.style.display = 'block';
     document.getElementById('riderCmdText').textContent =
-        `GEORADIUS restaurants:geo ${lng.toFixed(4)} ${lat.toFixed(4)} ${RADIUS_MILES} mi ASC WITHDIST COUNT 20`;
+        `GEOSEARCH restaurants:geo FROMLONLAT ${lng.toFixed(4)} ${lat.toFixed(4)} BYRADIUS ${RADIUS_MILES} mi ASC WITHCOORD WITHDIST COUNT 20`;
 
     try {
-        const resp = await fetch('/api/rider/nearby', {
+        const resp = await fetch('/api/rider/update', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({latitude: lat, longitude: lng, radiusMiles: RADIUS_MILES})
+            body: JSON.stringify({ riderId: RIDER_ID, latitude: lat, longitude: lng })
         });
         if (!resp.ok) return;
         const data = await resp.json();
 
-        // Update timing strip
+        // Execution time: show Redis + PostGIS combined latency
+        const zoneLabel = data.currentZone ? ` · Zone: ${esc(data.currentZone)}` : ' · Outside zones';
         document.getElementById('riderTiming').textContent =
-            `⚡ Redis: ${data.executionTimeMs} ms  ·  ${data.count} nearby`;
+            `⚡ ${data.executionTimeMs} ms  ·  ${data.nearbyRestaurants.length} nearby${zoneLabel}`;
 
-        // Update restaurant dot colors: green = nearby, gray = outside
-        const nearbyIds = new Set(data.restaurants.map(r => r.id));
+        // Update zone display in controls bar
+        const zoneBadge = document.getElementById('riderZone');
+        if (zoneBadge) {
+            zoneBadge.textContent = data.currentZone ? data.currentZone : '—';
+            zoneBadge.className   = data.currentZone ? 'zone-badge active' : 'zone-badge';
+        }
+
+        // Update restaurant dot colors
+        const nearbyIds = new Set(data.nearbyRestaurants.map(r => r.id));
         riderAllMarkers.forEach((marker, id) => {
-            if (nearbyIds.has(id)) {
-                marker.setStyle({fillColor: '#16a34a', radius: 10, fillOpacity: 0.95});
+            if (id === currentAssignedId) {
+                // Assigned → gold star (kept by RIDER_ASSIGNED SSE event)
+                marker.setStyle({ fillColor: '#f59e0b', radius: 13, fillOpacity: 1.0 });
+            } else if (nearbyIds.has(id)) {
+                marker.setStyle({ fillColor: '#16a34a', radius: 10, fillOpacity: 0.95 });
             } else {
-                marker.setStyle({fillColor: '#94a3b8', radius: 7, fillOpacity: 0.75});
+                marker.setStyle({ fillColor: '#94a3b8', radius: 7, fillOpacity: 0.75 });
             }
         });
+
         // Update popups for nearby restaurants with distance
-        data.restaurants.forEach(r => {
+        data.nearbyRestaurants.forEach(r => {
             const m = riderAllMarkers.get(r.id);
-            if (m) m.bindPopup(
+            if (!m) return;
+            const isAssigned = r.id === data.assignedRestaurantId;
+            m.bindPopup(
                 `<b>${esc(r.name)}</b><br>${esc(r.cuisine || '')}<br>` +
-                `<span style="color:#16a34a">✓ ${r.distanceMiles} mi away</span>`
+                (isAssigned
+                    ? `<span style="color:#f59e0b">⭐ ASSIGNED — ${r.distanceMiles} mi</span>`
+                    : `<span style="color:#16a34a">✓ ${r.distanceMiles} mi away</span>`)
             );
         });
 
-        renderRiderList(data.restaurants);
-    } catch (e) { console.error('Rider search failed:', e); }
+        renderRiderList(data.nearbyRestaurants, data.assignedRestaurantId);
+    } catch (e) { console.error('Rider update failed:', e); }
 }
 
-function renderRiderList(items) {
+// ── Sidebar list ──────────────────────────────────────────────────────────────
+
+function renderRiderList(items, assignedId) {
     const ul    = document.getElementById('riderList');
     const count = document.getElementById('riderCount');
     if (!items?.length) {
@@ -444,18 +581,23 @@ function renderRiderList(items) {
         return;
     }
     count.textContent = `${items.length} found`;
-    ul.innerHTML = items.map(r => `
-        <li>
+    ul.innerHTML = items.map(r => {
+        const isAssigned = r.id === assignedId;
+        return `<li class="${isAssigned ? 'assigned-row' : ''}">
           <div>
-            <div class="r-name">${esc(r.name)}</div>
+            <div class="r-name">${isAssigned ? '⭐ ' : ''}${esc(r.name)}</div>
             <div class="r-cuisine">${esc(r.cuisine || '')}</div>
           </div>
-          <span class="r-dist redis-dist">${r.distanceMiles} mi</span>
-        </li>`).join('');
+          <span class="r-dist ${isAssigned ? 'assigned-dist' : 'redis-dist'}">${r.distanceMiles} mi</span>
+        </li>`;
+    }).join('');
 }
+
+// ── Toggle simulation ─────────────────────────────────────────────────────────
 
 async function toggleRider() {
     await initRiderMap();
+    initSse();       // open SSE connection on first start
     const btn = document.getElementById('riderStartBtn');
     if (riderRunning) {
         clearInterval(riderInterval);
@@ -475,6 +617,7 @@ async function toggleRider() {
 // Auto-search on page load
 window.addEventListener('DOMContentLoaded', () => {
     runSearch();
+    renderEventLog();   // show empty state
     document.getElementById('riderSpeed').addEventListener('change', () => {
         if (riderRunning) {
             clearInterval(riderInterval);
