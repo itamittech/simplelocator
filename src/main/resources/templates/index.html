@@ -22,6 +22,7 @@
         <div class="header-badge">
             <span class="db-badge">PostgreSQL 16</span>
             <span class="db-badge postgis">PostGIS 3.4</span>
+            <span class="db-badge redis-db">Redis 7</span>
         </div>
     </div>
 </header>
@@ -349,10 +350,111 @@ AND ST_DWithin(..., 8046.72)</pre></div>
     </div>
 </section>
 
+<!-- ═══════════════════════  RIDER MODE  ════════════════════════════════ -->
+<section class="rider-section">
+    <div class="container">
+        <h2 class="section-title">Rider Mode — <span class="redis-highlight">Redis GEO</span></h2>
+        <p class="section-sub">A delivery rider drives through Manhattan — Redis finds nearby restaurants in real-time using native geo commands</p>
+
+        <!-- Redis concept card -->
+        <div class="rider-concept-grid">
+            <div class="concept-card redis-card">
+                <div class="concept-header">
+                    <div class="index-badge redis-badge">Redis</div>
+                    <div>
+                        <div class="index-name">GEO Commands</div>
+                        <div class="index-type">Sorted Set (52-bit geohash score)</div>
+                    </div>
+                </div>
+                <div class="viz-box">
+                    <div class="redis-key-label">KEY: <code>restaurants:geo</code> <span class="ds-badge">Sorted Set</span></div>
+                    <table class="redis-table">
+                        <thead><tr><th>score (geohash52)</th><th>member</th></tr></thead>
+                        <tbody>
+                            <tr><td class="score">3.29720…×10¹⁴</td><td class="member">"1" → Joe's Pizza</td></tr>
+                            <tr><td class="score">3.29721…×10¹⁴</td><td class="member">"5" → Nobu</td></tr>
+                            <tr><td class="score">3.29724…×10¹⁴</td><td class="member">"12" → Le Bernardin</td></tr>
+                            <tr><td class="score">…</td><td class="member">…</td></tr>
+                        </tbody>
+                    </table>
+                    <div class="redis-note">Nearby IDs share close score values — O(log N) radius scan</div>
+                    <div class="viz-caption">Redis encodes (lng, lat) into a single 52-bit integer score</div>
+                </div>
+                <ul class="concept-points">
+                    <li>All 23 restaurants loaded via <code>GEOADD</code> on app startup</li>
+                    <li><code>GEORADIUS</code> scans sorted-set scores within a radius — no SQL, no geometry types</li>
+                    <li>Sub-millisecond for small datasets; ideal for <strong>high-frequency location updates</strong></li>
+                    <li>Works alongside any primary database — Redis is the <strong>fast proximity layer</strong></li>
+                </ul>
+                <div class="sql-block">
+                    <div class="sql-label">Redis Commands</div>
+<pre># Load (once at startup)
+GEOADD restaurants:geo lng lat "id" …
+
+# Query on every rider location update
+GEORADIUS restaurants:geo lng lat 2 mi
+  ASC WITHDIST COUNT 20</pre>
+                </div>
+            </div>
+
+            <div class="flow-card redis-flow-card">
+                <div class="flow-title"><span class="index-badge redis-badge" style="width:auto;padding:4px 10px">Redis</span> Query Flow</div>
+                <ol class="flow-steps">
+                    <li>App starts → <code>GEOADD</code> loads all 23 restaurants into a single sorted set</li>
+                    <li>Rider location changes → POST <code>/api/rider/nearby</code> with lat/lng</li>
+                    <li>Spring calls <code>GEORADIUS key lng lat 2 mi ASC WITHDIST</code></li>
+                    <li>Redis scans geohash scores within the 2-mile band — pure in-memory</li>
+                    <li>Results returned with distance in miles, sorted nearest-first</li>
+                    <li>No PostGIS, no geometry columns, no SQL at query time</li>
+                </ol>
+                <div class="redis-vs">
+                    <div class="vs-row"><span class="vs-label">vs PostGIS GiST</span><span class="vs-val">No disk I/O — all in RAM</span></div>
+                    <div class="vs-row"><span class="vs-label">Trade-off</span><span class="vs-val">No complex spatial ops (polygons, intersects)</span></div>
+                    <div class="vs-row"><span class="vs-label">Best for</span><span class="vs-val">Continuous location tracking, real-time apps</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Controls bar -->
+        <div class="rider-controls-bar">
+            <button class="rider-btn" id="riderStartBtn" onclick="toggleRider()">▶ Start Riding</button>
+            <div class="speed-control">
+                <span>Speed:</span>
+                <select id="riderSpeed">
+                    <option value="3000">Slow</option>
+                    <option value="1500" selected>Normal</option>
+                    <option value="700">Fast</option>
+                </select>
+            </div>
+            <div class="rider-pos" id="riderPos">📍 awaiting start…</div>
+            <div class="rider-cmd" id="riderCmd" style="display:none">
+                <code id="riderCmdText"></code>
+            </div>
+        </div>
+
+        <!-- Map + Sidebar -->
+        <div class="rider-layout">
+            <div id="map-rider" class="map-container rider-map"></div>
+            <div class="rider-sidebar">
+                <div class="rider-sidebar-header">
+                    <span class="redis-badge-sm">Redis</span>
+                    <span class="rider-sidebar-title">Nearby Restaurants</span>
+                    <span class="rider-count" id="riderCount">—</span>
+                </div>
+                <div class="rider-timing" id="riderTiming">Start simulation to see live results</div>
+                <ul class="r-list" id="riderList">
+                    <li class="r-empty">Click "Start Riding" above</li>
+                </ul>
+            </div>
+        </div>
+
+    </div>
+</section>
+
 <footer class="site-footer">
     <div class="container">
-        <p>SimpleLocator · Spring Boot 3.2 · PostgreSQL 16 · PostGIS 3.4 · Hibernate Spatial 6.4</p>
-        <p class="footer-sub">pgAdmin → <code>http://localhost:5050</code> &nbsp;|&nbsp; REST → <code>/api/restaurants/search/compare</code></p>
+        <p>SimpleLocator · Spring Boot 3.2 · PostgreSQL 16 · PostGIS 3.4 · Redis 7 · Hibernate Spatial 6.4</p>
+        <p class="footer-sub">pgAdmin → <code>http://localhost:5050</code> &nbsp;|&nbsp; REST → <code>/api/restaurants/search/compare</code> &nbsp;|&nbsp; Rider → <code>/api/rider/nearby</code></p>
     </div>
 </footer>
 

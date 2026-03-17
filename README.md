@@ -1,20 +1,19 @@
 # SimpleLocator — Geospatial Index Demo
 
-A Spring Boot application that demonstrates **three geospatial indexing strategies** in
-PostgreSQL/PostGIS by finding restaurants within **5 miles** of a user-supplied location.
-
-All three methods return the same results (correctness) but use fundamentally different
-index types and query patterns — making it easy to compare them with `EXPLAIN ANALYZE`.
+A Spring Boot application that demonstrates **four geospatial indexing strategies** across
+PostgreSQL/PostGIS and Redis — finding restaurants near a user-supplied location using
+fundamentally different data structures.
 
 ---
 
 ## What This Demonstrates
 
-| Index | PostgreSQL Keyword | Data Structure | Primary Operator |
-|-------|-------------------|----------------|-----------------|
-| **GiST** | `USING GIST` | R-tree | `ST_DWithin` |
-| **SP-GiST** | `USING SPGIST` | Quadtree | `&&` (bbox overlap) |
-| **Geohash** | `USING btree` | Hash string prefix | `LIKE 'prefix%'` |
+| Index | Store | Data Structure | Primary Operator | Use-case |
+|-------|-------|----------------|-----------------|----------|
+| **GiST** | PostgreSQL | R-tree | `ST_DWithin` | General spatial queries |
+| **SP-GiST** | PostgreSQL | Quadtree | `&&` (bbox overlap) | Uniform point data |
+| **Geohash** | PostgreSQL | B-tree (string prefix) | `LIKE 'prefix%'` | Any string-indexed store |
+| **Redis GEO** | Redis | Sorted Set (geohash score) | `GEORADIUS` | Real-time location tracking |
 
 ---
 
@@ -74,6 +73,7 @@ Precision 9: 'dr5reuueb'   → ~4.4  m  × 4.4  m   ← stored precision
 |-----------|-----------|
 | Backend | Spring Boot 3.2.3, Java 21+ (tested on JDK 25) |
 | Database | PostgreSQL 16 + PostGIS 3.4 |
+| Cache / Geo | Redis 7 (via Spring Data Redis + Lettuce) |
 | ORM | Spring Data JPA + Hibernate Spatial 6.4 |
 | Geometry | JTS (LocationTech) 1.19.0 |
 | Geohash | `ch.hsr:geohash:1.4.0` |
@@ -102,6 +102,7 @@ docker-compose up -d
 This starts:
 - **PostgreSQL 16 + PostGIS 3.4** on `localhost:5432`
 - **pgAdmin 4** on `http://localhost:5050`
+- **Redis 7** on `localhost:6379`
 
 ### 2. Run the application
 
@@ -143,12 +144,48 @@ All endpoints accept a `POST` body with the user's current coordinates:
 }
 ```
 
+### PostGIS endpoints (5-mile search)
+
 | Method | Path | Index Used |
 |--------|------|-----------|
 | `POST` | `/api/restaurants/search/gist` | GiST (R-tree) |
 | `POST` | `/api/restaurants/search/spgist` | SP-GiST (Quadtree) |
 | `POST` | `/api/restaurants/search/geohash` | Geohash B-tree |
 | `POST` | `/api/restaurants/search/compare` | All three at once |
+| `POST` | `/api/restaurants/search/debug` | Map visualization metadata |
+
+### Redis GEO endpoints (Rider mode, 2-mile search)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/rider/nearby` | GEORADIUS search from rider's current position |
+| `GET`  | `/api/rider/restaurants` | All restaurants from Redis cache (map init) |
+
+**Rider request body:**
+```json
+{
+  "latitude":    40.7580,
+  "longitude":  -73.9855,
+  "radiusMiles": 2.0
+}
+```
+
+**Rider response:**
+```json
+{
+  "searchLat": 40.758, "searchLng": -73.9855,
+  "radiusMiles": 2.0, "executionTimeMs": 1, "count": 5,
+  "restaurants": [
+    { "id": 3, "name": "Ippudo NY", "cuisine": "Japanese", "distanceMiles": 0.34, ... }
+  ]
+}
+```
+
+```bash
+curl -X POST http://localhost:8080/api/rider/nearby \
+  -H "Content-Type: application/json" \
+  -d '{"latitude": 40.7580, "longitude": -73.9855, "radiusMiles": 2.0}'
+```
 
 ### Example — GiST search
 
@@ -369,6 +406,76 @@ public SearchResult searchWithGist(LocationRequest req) {
 The native query returns `Object[]` rows because of the extra `dist_meters` computed column.
 `mapRow()` casts each column by position:
 - `row[0]` = id, `row[1]` = name, ... `row[9]` = dist_meters
+
+---
+
+---
+
+## Feature 4 — Rider Mode (Redis GEO)
+
+### How Redis GEO works
+
+Redis encodes `(longitude, latitude)` pairs into a **52-bit integer geohash** stored as
+the score of a Sorted Set. Because sorted sets are ordered by score, a radius search
+becomes a score-range scan — `O(N+log M)` where N is results and M is total members.
+
+```
+KEY: restaurants:geo  (Sorted Set)
+┌──────────────────────┬───────────┐
+│  score (geohash52)   │  member   │
+├──────────────────────┼───────────┤
+│  3.29720…×10¹⁴       │  "1"      │  → Joe's Pizza
+│  3.29721…×10¹⁴       │  "5"      │  → Nobu
+│  3.29724…×10¹⁴       │  "12"     │  → Le Bernardin
+│  …                   │  …        │
+└──────────────────────┴───────────┘
+```
+
+### Data loading (`RedisGeoService.java`)
+
+On `ApplicationReadyEvent`, `RedisGeoService` loads all 23 restaurants into Redis and
+an in-memory `Map<Long, Restaurant>` cache:
+
+```java
+@EventListener(ApplicationReadyEvent.class)
+public void loadRestaurantsIntoRedis() {
+    GeoOperations<String, String> geo = stringRedisTemplate.opsForGeo();
+    stringRedisTemplate.delete(GEO_KEY);
+    List<Restaurant> all = restaurantRepository.findAll();
+    for (Restaurant r : all) {
+        geo.add(GEO_KEY, new Point(r.getLongitude(), r.getLatitude()), String.valueOf(r.getId()));
+        restaurantCache.put(r.getId(), r);
+    }
+}
+```
+
+### Query (`RedisGeoService.findNearby`)
+
+```java
+GeoResults<GeoLocation<String>> results = geo.radius(
+    GEO_KEY,
+    new Circle(new Point(lng, lat), new Distance(radiusMiles, Metrics.MILES)),
+    RedisGeoCommands.GeoRadiusCommandArgs.newGeoRadiusArgs()
+        .includeDistance().sortAscending().limit(20)
+);
+```
+
+Maps to the Redis command:
+```
+GEORADIUS restaurants:geo <lng> <lat> 2 mi ASC WITHDIST COUNT 20
+```
+
+Results include the distance in miles, sorted nearest-first. Restaurant metadata
+(name, cuisine, lat/lng) comes from the in-memory cache — no second Redis or DB hit.
+
+### Rider simulation (UI)
+
+The browser simulates a rider moving through 14 Manhattan waypoints (Financial District →
+59th St), interpolating 12 steps between each pair. On every step:
+1. The rider marker and 2-mile circle move on the Leaflet map
+2. `POST /api/rider/nearby` fires with the new coordinates
+3. Nearby restaurant dots turn green; others turn gray
+4. The live Redis command is displayed in the controls bar
 
 ---
 

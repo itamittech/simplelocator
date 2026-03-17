@@ -287,5 +287,199 @@ function esc(s) {
     return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// ── Rider / Redis GEO ────────────────────────────────────────────────────────
+
+/** Route waypoints through Manhattan (Financial District → 59th St) */
+const RIDER_ROUTE = [
+    [40.7128, -74.0060],  // Financial District
+    [40.7175, -74.0030],  // Tribeca
+    [40.7230, -74.0003],  // SoHo / Canal St
+    [40.7267, -73.9981],  // NoHo
+    [40.7282, -73.9942],  // East Village
+    [40.7330, -73.9923],  // Union Square
+    [40.7359, -73.9911],  // Gramercy
+    [40.7421, -73.9897],  // Flatiron
+    [40.7484, -73.9854],  // Herald Square
+    [40.7549, -73.9840],  // Penn Station
+    [40.7580, -73.9855],  // Times Square
+    [40.7614, -73.9776],  // Bryant Park / 5th Ave
+    [40.7680, -73.9819],  // Rockefeller Center
+    [40.7711, -73.9820],  // 59th St / Central Park South
+];
+
+const STEPS_PER_SEG = 12;   // interpolation steps between waypoints
+const RADIUS_MILES  = 2.0;  // fixed 2-mile search radius
+
+let riderMap        = null;
+let riderMarker     = null;
+let riderCircle     = null;
+let riderRouteLine  = null;
+let riderInterval   = null;
+let riderRunning    = false;
+let riderSeg        = 0;
+let riderStep       = 0;
+const riderAllMarkers = new Map();  // id → L.circleMarker (all 23 restaurants)
+
+/** Interpolate position along the route */
+function getRiderPos() {
+    const p1 = RIDER_ROUTE[riderSeg];
+    const p2 = RIDER_ROUTE[(riderSeg + 1) % RIDER_ROUTE.length];
+    const t  = riderStep / STEPS_PER_SEG;
+    return [p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t];
+}
+
+function advanceRiderPos() {
+    riderStep++;
+    if (riderStep >= STEPS_PER_SEG) {
+        riderStep = 0;
+        riderSeg  = (riderSeg + 1) % (RIDER_ROUTE.length - 1);
+    }
+}
+
+async function initRiderMap() {
+    if (riderMap) return;
+
+    riderMap = L.map('map-rider').setView(RIDER_ROUTE[0], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(riderMap);
+
+    // Dashed route line
+    riderRouteLine = L.polyline(RIDER_ROUTE, {
+        color: '#DC382D', weight: 2.5, dashArray: '6 5', opacity: 0.5
+    }).addTo(riderMap);
+
+    // 2-mile search circle
+    riderCircle = L.circle(RIDER_ROUTE[0], {
+        radius: RADIUS_MILES * 1609.344,
+        color: '#DC382D', weight: 2, dashArray: '8 5', fillOpacity: 0.05
+    }).addTo(riderMap);
+
+    // Rider marker (emoji icon)
+    const riderIcon = L.divIcon({
+        html: '<div class="rider-icon-div">🏍️</div>',
+        iconSize: [32, 32], iconAnchor: [16, 16], className: ''
+    });
+    riderMarker = L.marker(RIDER_ROUTE[0], {icon: riderIcon, zIndexOffset: 1000})
+        .bindTooltip('Rider').addTo(riderMap);
+
+    // Pre-load all restaurants as gray dots
+    try {
+        const resp = await fetch('/api/rider/restaurants');
+        if (resp.ok) {
+            const all = await resp.json();
+            all.forEach(r => {
+                const m = L.circleMarker([r.latitude, r.longitude], {
+                    radius: 7, fillColor: '#94a3b8', color: '#fff',
+                    weight: 1.5, fillOpacity: 0.75
+                }).bindPopup(`<b>${esc(r.name)}</b><br>${esc(r.cuisine || '')}<br><span style="color:#94a3b8">Outside 2-mile radius</span>`);
+                m.addTo(riderMap);
+                riderAllMarkers.set(r.id, m);
+            });
+        }
+    } catch (e) { console.error('Could not pre-load restaurants:', e); }
+}
+
+async function riderTick() {
+    const [lat, lng] = getRiderPos();
+    advanceRiderPos();
+
+    // Move marker + circle
+    riderMarker.setLatLng([lat, lng]);
+    riderCircle.setLatLng([lat, lng]);
+    riderMap.panTo([lat, lng], {animate: true, duration: 0.4});
+
+    // Update position display
+    document.getElementById('riderPos').textContent =
+        `📍 ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+
+    // Show the exact Redis command being executed
+    const cmdEl = document.getElementById('riderCmd');
+    cmdEl.style.display = 'block';
+    document.getElementById('riderCmdText').textContent =
+        `GEORADIUS restaurants:geo ${lng.toFixed(4)} ${lat.toFixed(4)} ${RADIUS_MILES} mi ASC WITHDIST COUNT 20`;
+
+    try {
+        const resp = await fetch('/api/rider/nearby', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({latitude: lat, longitude: lng, radiusMiles: RADIUS_MILES})
+        });
+        if (!resp.ok) return;
+        const data = await resp.json();
+
+        // Update timing strip
+        document.getElementById('riderTiming').textContent =
+            `⚡ Redis: ${data.executionTimeMs} ms  ·  ${data.count} nearby`;
+
+        // Update restaurant dot colors: green = nearby, gray = outside
+        const nearbyIds = new Set(data.restaurants.map(r => r.id));
+        riderAllMarkers.forEach((marker, id) => {
+            if (nearbyIds.has(id)) {
+                marker.setStyle({fillColor: '#16a34a', radius: 10, fillOpacity: 0.95});
+            } else {
+                marker.setStyle({fillColor: '#94a3b8', radius: 7, fillOpacity: 0.75});
+            }
+        });
+        // Update popups for nearby restaurants with distance
+        data.restaurants.forEach(r => {
+            const m = riderAllMarkers.get(r.id);
+            if (m) m.bindPopup(
+                `<b>${esc(r.name)}</b><br>${esc(r.cuisine || '')}<br>` +
+                `<span style="color:#16a34a">✓ ${r.distanceMiles} mi away</span>`
+            );
+        });
+
+        renderRiderList(data.restaurants);
+    } catch (e) { console.error('Rider search failed:', e); }
+}
+
+function renderRiderList(items) {
+    const ul    = document.getElementById('riderList');
+    const count = document.getElementById('riderCount');
+    if (!items?.length) {
+        ul.innerHTML = '<li class="r-empty">No restaurants within 2 miles</li>';
+        count.textContent = '0 found';
+        return;
+    }
+    count.textContent = `${items.length} found`;
+    ul.innerHTML = items.map(r => `
+        <li>
+          <div>
+            <div class="r-name">${esc(r.name)}</div>
+            <div class="r-cuisine">${esc(r.cuisine || '')}</div>
+          </div>
+          <span class="r-dist redis-dist">${r.distanceMiles} mi</span>
+        </li>`).join('');
+}
+
+async function toggleRider() {
+    await initRiderMap();
+    const btn = document.getElementById('riderStartBtn');
+    if (riderRunning) {
+        clearInterval(riderInterval);
+        riderRunning = false;
+        btn.textContent = '▶ Resume Riding';
+        btn.classList.remove('paused');
+    } else {
+        riderRunning = true;
+        btn.textContent = '⏸ Pause';
+        btn.classList.add('paused');
+        riderTick();   // immediate first tick
+        const speed = parseInt(document.getElementById('riderSpeed').value);
+        riderInterval = setInterval(riderTick, speed);
+    }
+}
+
 // Auto-search on page load
-window.addEventListener('DOMContentLoaded', () => runSearch());
+window.addEventListener('DOMContentLoaded', () => {
+    runSearch();
+    document.getElementById('riderSpeed').addEventListener('change', () => {
+        if (riderRunning) {
+            clearInterval(riderInterval);
+            const speed = parseInt(document.getElementById('riderSpeed').value);
+            riderInterval = setInterval(riderTick, speed);
+        }
+    });
+});
