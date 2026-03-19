@@ -427,6 +427,128 @@ code {
 .ev-assign   { border-left:3px solid #d97706; background:rgba(245,158,11,.03); }
 .ev-unassign { border-left:3px solid #94a3b8; }
 
+/* ── GIN + JSONB Menu Search Section ────────────────────────── */
+.menu-section { padding:48px 0; background:#f8fafc; border-top:1px solid #e2e8f0; }
+
+:root {
+    --gin:      #7c3aed;
+    --gin-lt:   #f3f0ff;
+    --jsonb:    #0891b2;
+    --jsonb-lt: #e0f2fe;
+}
+
+.gin-highlight  { color:var(--gin); }
+.jsonb-highlight{ color:var(--jsonb); }
+
+.gin-badge   { background:var(--gin);   color:#fff; font-weight:700; font-size:.72rem; padding:3px 8px; border-radius:6px; display:inline-block; min-width:40px; text-align:center; }
+.jsonb-badge { background:var(--jsonb); color:#fff; font-weight:700; font-size:.72rem; padding:3px 8px; border-radius:6px; display:inline-block; min-width:48px; text-align:center; }
+.combined-badge { background:linear-gradient(135deg,var(--gist),var(--gin)); color:#fff; font-weight:700; font-size:.72rem; padding:3px 8px; border-radius:6px; display:inline-block; min-width:36px; text-align:center; }
+
+/* GIN FTS concept card */
+.concept-card.gin-fts     { border-top:4px solid var(--gin); }
+.concept-card.jsonb-card  { border-top:4px solid var(--jsonb); }
+.concept-card.combined-card { border-top:4px solid #6366f1; }
+
+.gin-concepts-grid { grid-template-columns: repeat(3,1fr); }
+@media(max-width:900px){ .gin-concepts-grid { grid-template-columns:1fr; } }
+@media(max-width:900px){ .menu-results-grid { grid-template-columns:1fr; } }
+
+/* GIN inverted index table */
+.gin-table  { width:100%; border-collapse:collapse; font-size:.8rem; margin-bottom:4px; }
+.gin-row    { display:flex; align-items:center; gap:6px; padding:3px 0; border-bottom:1px solid #f1f5f9; }
+.gin-term   { font-family:'Cascadia Code',monospace; background:var(--gin-lt); color:var(--gin); padding:1px 6px; border-radius:4px; min-width:70px; font-size:.78rem; }
+.gin-arrow  { color:#94a3b8; font-size:.85rem; }
+.gin-postings { color:#475569; font-size:.76rem; }
+
+/* JSONB document */
+.jsonb-doc      { background:#f8fafc; border-radius:8px; padding:10px 12px; }
+.jsonb-label    { font-size:.72rem; font-weight:600; color:var(--jsonb); text-transform:uppercase; letter-spacing:.05em; margin-bottom:4px; }
+.jsonb-pre      { font-family:'Cascadia Code',monospace; font-size:.72rem; background:transparent; padding:0; margin:0; white-space:pre; color:#0f172a; }
+
+/* Combined flow */
+.combined-flow  { display:flex; flex-direction:column; gap:4px; align-items:stretch; }
+.cf-step        { display:flex; align-items:center; gap:8px; background:#fff; border-radius:6px; padding:6px 10px; border:1px solid #e2e8f0; }
+.cf-badge       { flex-shrink:0; }
+.cf-desc        { font-size:.76rem; color:#475569; }
+.cf-arrow       { text-align:center; font-size:1rem; font-weight:700; color:#6366f1; padding:2px 0; }
+.cf-result      { background:linear-gradient(135deg,#e0e7ff,#e0f2fe); border-radius:6px; padding:6px 10px; text-align:center; font-size:.78rem; font-weight:600; color:#3730a3; }
+
+/* Menu search form */
+.menu-search-card {
+    background:#fff; border-radius:16px; padding:28px 32px;
+    box-shadow:0 4px 24px rgba(0,0,0,.06); margin-top:32px;
+}
+.menu-search-card h3 { font-size:1.2rem; font-weight:700; margin-bottom:4px; }
+.menu-search-form {
+    display:flex; align-items:flex-end; gap:14px; flex-wrap:wrap; margin-top:16px;
+}
+.menu-input-group { display:flex; flex-direction:column; gap:4px; }
+.menu-input-group label { font-size:.78rem; font-weight:600; color:#475569; text-transform:uppercase; letter-spacing:.05em; }
+.menu-input-group input {
+    width:260px; padding:10px 14px; border:2px solid #e2e8f0;
+    border-radius:8px; font-size:1rem; outline:none; transition:border-color .2s;
+}
+.menu-input-group input:focus { border-color:var(--gin); }
+.menu-input-group select {
+    padding:10px 14px; border:2px solid #e2e8f0; border-radius:8px;
+    font-size:1rem; outline:none; background:#fff; cursor:pointer;
+    transition:border-color .2s; min-width:160px;
+}
+.menu-input-group select:focus { border-color:var(--gin); }
+.menu-search-btn { background:var(--gin) !important; }
+.menu-search-btn:hover { background:#6d28d9 !important; }
+
+/* Menu loading */
+.menu-loading { display:flex; align-items:center; gap:12px; padding:24px; color:#64748b; }
+
+/* Menu results */
+.menu-results-header {
+    display:flex; align-items:center; justify-content:space-between;
+    flex-wrap:wrap; gap:12px; margin:20px 0 16px;
+}
+.menu-index-badge-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.index-op      { font-size:.78rem; color:#64748b; font-family:'Cascadia Code',monospace; }
+.index-intersect { font-weight:700; color:#6366f1; font-size:1rem; }
+.menu-timing-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.menu-query-label { font-size:.82rem; color:#64748b; font-style:italic; }
+
+.menu-results-grid {
+    display:grid; grid-template-columns:repeat(auto-fill, minmax(340px,1fr)); gap:16px;
+}
+
+.menu-result-card {
+    background:#fff; border-radius:12px; padding:20px;
+    box-shadow:0 2px 12px rgba(0,0,0,.06);
+    border-left:4px solid var(--gin); transition:transform .15s,box-shadow .15s;
+}
+.menu-result-card:hover { transform:translateY(-2px); box-shadow:0 4px 20px rgba(0,0,0,.1); }
+
+.menu-card-header { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:10px; }
+.menu-score-col { flex-shrink:0; text-align:right; min-width:90px; }
+.menu-score-label { font-size:.68rem; font-weight:600; text-transform:uppercase; color:#94a3b8; letter-spacing:.05em; margin-bottom:3px; }
+.menu-score-bar-track { background:#f1f5f9; border-radius:4px; height:18px; overflow:hidden; }
+.menu-score-bar {
+    background:linear-gradient(90deg,var(--gin),#a78bfa);
+    height:100%; display:flex; align-items:center; justify-content:flex-end;
+    padding-right:4px; font-size:.67rem; font-weight:700; color:#fff;
+    min-width:30px; border-radius:4px;
+}
+
+.menu-diet-row { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; }
+.menu-diet-tag {
+    background:var(--gin-lt); color:var(--gin); font-size:.7rem; font-weight:600;
+    padding:2px 8px; border-radius:10px; border:1px solid rgba(124,58,237,.2);
+}
+
+.menu-items-list { display:flex; flex-direction:column; gap:8px; border-top:1px solid #f1f5f9; padding-top:10px; }
+.menu-item { padding:6px 0; }
+.menu-item-name {
+    font-size:.88rem; font-weight:600; color:#1e293b;
+    display:flex; justify-content:space-between; align-items:baseline;
+}
+.menu-item-price { color:var(--gin); font-size:.82rem; font-weight:700; }
+.menu-item-desc  { font-size:.78rem; color:#64748b; margin-top:2px; line-height:1.4; }
+
 /* ── Footer ─────────────────────────────────────────────────── */
 .site-footer { background:#0f172a; color:#64748b; text-align:center; padding:20px 24px; font-size:.82rem; }
 .footer-sub  { margin-top:4px; }

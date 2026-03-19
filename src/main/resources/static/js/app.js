@@ -287,6 +287,95 @@ function esc(s) {
     return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// ── Menu Search (GIN FTS + GIN JSONB + GiST) ─────────────────────────────────
+
+async function runMenuSearch() {
+    const lat = parseFloat(document.getElementById('latitude').value);
+    const lng = parseFloat(document.getElementById('longitude').value);
+    if (isNaN(lat) || isNaN(lng)) { alert('Enter valid coordinates in the search form above.'); return; }
+
+    const query   = document.getElementById('menuQuery').value.trim();
+    const dietary = document.getElementById('menuDietary').value;
+    if (!query) { alert('Enter a menu search term.'); return; }
+
+    const btn = document.getElementById('menuSearchBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="btn-icon">⏳</span> Searching…';
+
+    document.getElementById('menuResultsSection').style.display  = 'block';
+    document.getElementById('menuLoading').style.display         = 'block';
+    document.getElementById('menuResultsContent').style.display  = 'none';
+    document.getElementById('menuResultsSection').scrollIntoView({ behavior: 'smooth' });
+
+    try {
+        const resp = await fetch('/api/restaurants/search/menu', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ latitude: lat, longitude: lng, query, dietary: dietary || null })
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        renderMenuResults(await resp.json());
+    } catch (err) {
+        document.getElementById('menuLoading').innerHTML =
+            `<p style="color:#ef4444">❌ Menu search failed: ${err.message}</p>`;
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<span class="btn-icon">🔎</span> Search Menu';
+    }
+}
+
+function renderMenuResults(data) {
+    document.getElementById('menuLoading').style.display      = 'none';
+    document.getElementById('menuResultsContent').style.display = 'block';
+
+    document.getElementById('menuCount').textContent  = `${data.resultCount} found`;
+    document.getElementById('menuTiming').textContent = `⏱ ${data.executionTimeMs} ms`;
+    const dietaryLabel = data.dietaryFilter && data.dietaryFilter !== 'none'
+        ? ` · dietary: ${esc(data.dietaryFilter)}` : '';
+    document.getElementById('menuQueryLabel').textContent = `"${esc(data.query)}"${dietaryLabel}`;
+
+    const grid  = document.getElementById('menuResultsList');
+    const empty = document.getElementById('menuEmptyNote');
+
+    if (!data.restaurants?.length) {
+        grid.innerHTML = '';
+        empty.style.display = 'block';
+        return;
+    }
+    empty.style.display = 'none';
+
+    grid.innerHTML = data.restaurants.map(r => {
+        const rankPct    = Math.round(r.relevanceScore * 100);
+        const rankWidth  = Math.max(rankPct, 5);
+        const dietaryTags = (r.dietaryOptions || [])
+            .map(d => `<span class="menu-diet-tag">${esc(d)}</span>`).join('');
+        const itemsHtml = (r.items || []).map(item => `
+            <div class="menu-item">
+                <div class="menu-item-name">${esc(item.name)}
+                    <span class="menu-item-price">$${item.price.toFixed(2)}</span>
+                </div>
+                <div class="menu-item-desc">${esc(item.description)}</div>
+            </div>`).join('');
+
+        return `<div class="menu-result-card">
+            <div class="menu-card-header">
+                <div>
+                    <div class="r-name">${esc(r.name)}</div>
+                    <div class="r-cuisine">${esc(r.cuisine || '')} · ${esc(r.priceRange || '')} · ${r.distanceMiles} mi</div>
+                </div>
+                <div class="menu-score-col">
+                    <div class="menu-score-label">ts_rank</div>
+                    <div class="menu-score-bar-track">
+                        <div class="menu-score-bar" style="width:${rankWidth}%">${r.relevanceScore.toFixed(3)}</div>
+                    </div>
+                </div>
+            </div>
+            ${dietaryTags ? `<div class="menu-diet-row">${dietaryTags}</div>` : ''}
+            <div class="menu-items-list">${itemsHtml}</div>
+        </div>`;
+    }).join('');
+}
+
 // ── Rider / Redis GEO ────────────────────────────────────────────────────────
 
 /** Route waypoints through Manhattan (Financial District → 59th St) */

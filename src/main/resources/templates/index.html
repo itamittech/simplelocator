@@ -350,6 +350,190 @@ AND ST_DWithin(..., 8046.72)</pre></div>
     </div>
 </section>
 
+<!-- ═══════════════════════  GIN + JSONB MENU SEARCH  ══════════════════ -->
+<section class="menu-section">
+    <div class="container">
+        <h2 class="section-title">Menu Search — <span class="gin-highlight">GIN Index</span> + <span class="jsonb-highlight">JSONB</span></h2>
+        <p class="section-sub">One query — three PostgreSQL index types working together: GiST for location, GIN for full-text, GIN for structured JSON</p>
+
+        <!-- Concept cards: GIN FTS + JSONB -->
+        <div class="concepts-grid gin-concepts-grid">
+
+            <!-- GIN FTS card -->
+            <div class="concept-card gin-fts">
+                <div class="concept-header">
+                    <div class="index-badge gin-badge">GIN</div>
+                    <div><div class="index-name">Inverted Index</div><div class="index-type">Full-Text Search</div></div>
+                </div>
+                <div class="viz-box">
+                    <div class="gin-table">
+                        <div class="gin-row"><span class="gin-term">pasta</span><span class="gin-arrow">→</span><span class="gin-postings">row 19 (Battello)</span></div>
+                        <div class="gin-row"><span class="gin-term">pizza</span><span class="gin-arrow">→</span><span class="gin-postings">rows 1, 11, 12, 19</span></div>
+                        <div class="gin-row"><span class="gin-term">miso</span><span class="gin-arrow">→</span><span class="gin-postings">row 8 (Nobu)</span></div>
+                        <div class="gin-row"><span class="gin-term">curry</span><span class="gin-arrow">→</span><span class="gin-postings">rows 16, 18</span></div>
+                        <div class="gin-row"><span class="gin-term">dumpling</span><span class="gin-arrow">→</span><span class="gin-postings">rows 17 (Nan Xiang)</span></div>
+                    </div>
+                    <div class="viz-caption">Lexeme → posting list (row IDs)</div>
+                </div>
+                <ul class="concept-points">
+                    <li>Tokenizes text into <strong>lexemes</strong> (stemmed words) stored as a <code>tsvector</code></li>
+                    <li>GIN maps each lexeme to a <strong>posting list</strong> of matching row IDs</li>
+                    <li>Query: <code>menu_search_vector @@ plainto_tsquery('pasta')</code></li>
+                    <li>Covers: restaurant name + cuisine + all menu item names + descriptions</li>
+                </ul>
+                <div class="sql-block"><div class="sql-label">tsvector column</div>
+<pre>-- Stored at migration time:
+menu_search_vector =
+  to_tsvector('english',
+    name || cuisine ||
+    item_names || item_descriptions
+  )
+
+-- Queried via GIN:
+WHERE menu_search_vector
+  @@ plainto_tsquery('english', ?)</pre></div>
+            </div>
+
+            <!-- JSONB card -->
+            <div class="concept-card jsonb-card">
+                <div class="concept-header">
+                    <div class="index-badge jsonb-badge">JSONB</div>
+                    <div><div class="index-name">Binary JSON</div><div class="index-type">GIN Containment Index</div></div>
+                </div>
+                <div class="viz-box">
+                    <div class="jsonb-doc">
+                        <div class="jsonb-label">menu column (JSONB):</div>
+<pre class="jsonb-pre">{
+  "items": [
+    { "name": "Veggie Ramen",
+      "price": 19.00,
+      "dietary": ["vegetarian","vegan"] }
+  ],
+  "dietary_options":
+    ["vegetarian","vegan"],
+  "price_range": "$$"
+}</pre>
+                    </div>
+                    <div class="viz-caption">Structured document — GIN indexes every key + value path</div>
+                </div>
+                <ul class="concept-points">
+                    <li>JSONB stores documents as <strong>binary decomposed</strong> key-value pairs — unlike JSON, it's indexable</li>
+                    <li>GIN on JSONB indexes <strong>every path and value</strong> in the document</li>
+                    <li><code>@&gt;</code> containment check: does the left document contain the right?</li>
+                    <li>Works like a <strong>NoSQL document filter</strong> inside PostgreSQL</li>
+                </ul>
+                <div class="sql-block"><div class="sql-label">GIN JSONB containment</div>
+<pre>-- GIN index created on menu column:
+CREATE INDEX ON restaurants
+  USING GIN(menu);
+
+-- Dietary filter via @> (contains):
+WHERE menu @> '{
+  "dietary_options": ["vegetarian"]
+}'::jsonb</pre></div>
+            </div>
+
+            <!-- Combined query card -->
+            <div class="concept-card combined-card">
+                <div class="concept-header">
+                    <div class="index-badge combined-badge">3×</div>
+                    <div><div class="index-name">Combined Query</div><div class="index-type">GiST + GIN + GIN</div></div>
+                </div>
+                <div class="viz-box">
+                    <div class="combined-flow">
+                        <div class="cf-step gist-step"><span class="cf-badge gist-badge">GiST</span><span class="cf-desc">ST_DWithin → within 5 miles</span></div>
+                        <div class="cf-arrow">∩</div>
+                        <div class="cf-step fts-step"><span class="cf-badge gin-badge">GIN</span><span class="cf-desc">tsvector @@ tsquery → menu text match</span></div>
+                        <div class="cf-arrow">∩</div>
+                        <div class="cf-step jsonb-step"><span class="cf-badge jsonb-badge">GIN</span><span class="cf-desc">menu @> jsonb → dietary filter</span></div>
+                        <div class="cf-arrow">=</div>
+                        <div class="cf-result">Nearby + relevant + dietary</div>
+                    </div>
+                    <div class="viz-caption">PostgreSQL intersects all three index scans</div>
+                </div>
+                <ul class="concept-points">
+                    <li>PostgreSQL's <strong>bitmap index scan</strong> intersects results from all three indexes</li>
+                    <li>Each index independently prunes rows — only the intersection is fetched</li>
+                    <li>Results ranked by <code>ts_rank()</code> relevance score, then distance</li>
+                </ul>
+                <div class="sql-block"><div class="sql-label">Combined SQL Pattern</div>
+<pre>WHERE
+  ST_DWithin(location_gist, ?, 8047)
+  -- ① GiST: prune by location
+
+  AND menu_search_vector
+      @@ plainto_tsquery('english', ?)
+  -- ② GIN/tsvector: prune by text
+
+  AND menu @> ?::jsonb
+  -- ③ GIN/JSONB: prune by dietary
+
+ORDER BY
+  ts_rank(...) DESC,  -- relevance first
+  dist_meters ASC     -- then distance</pre></div>
+            </div>
+
+        </div>
+
+        <!-- Menu Search form -->
+        <div class="menu-search-card">
+            <h3>Try the Combined Query</h3>
+            <p class="search-sub">Search menu text + filter by dietary preference — within 5 miles of your location above</p>
+            <div class="menu-search-form">
+                <div class="menu-input-group">
+                    <label for="menuQuery">Menu Search</label>
+                    <input type="text" id="menuQuery" placeholder="e.g. pasta, burger, curry, sushi…" value="pasta"/>
+                </div>
+                <div class="menu-input-group">
+                    <label for="menuDietary">Dietary</label>
+                    <select id="menuDietary">
+                        <option value="">Any</option>
+                        <option value="vegetarian">Vegetarian</option>
+                        <option value="vegan">Vegan</option>
+                        <option value="gluten-free">Gluten-Free</option>
+                        <option value="halal">Halal</option>
+                        <option value="kosher">Kosher</option>
+                    </select>
+                </div>
+                <button class="btn-search menu-search-btn" id="menuSearchBtn" onclick="runMenuSearch()">
+                    <span class="btn-icon">🔎</span> Search Menu
+                </button>
+            </div>
+        </div>
+
+        <!-- Menu Search Results -->
+        <div id="menuResultsSection" style="display:none">
+            <div class="menu-loading" id="menuLoading">
+                <div class="spinner"></div><p>Running combined GiST + GIN + GIN query…</p>
+            </div>
+            <div id="menuResultsContent" style="display:none">
+                <div class="menu-results-header">
+                    <div class="menu-index-badge-row">
+                        <span class="r-badge gist-badge">GiST</span>
+                        <span class="index-op">ST_DWithin</span>
+                        <span class="index-intersect">∩</span>
+                        <span class="r-badge gin-badge">GIN</span>
+                        <span class="index-op">tsvector @@</span>
+                        <span class="index-intersect">∩</span>
+                        <span class="r-badge jsonb-badge">GIN</span>
+                        <span class="index-op">JSONB @&gt;</span>
+                    </div>
+                    <div class="menu-timing-row">
+                        <span id="menuCount" class="r-count">—</span>
+                        <span id="menuTiming" class="r-timing">—</span>
+                        <span id="menuQueryLabel" class="menu-query-label">—</span>
+                    </div>
+                </div>
+                <div class="menu-results-grid" id="menuResultsList"></div>
+                <p class="results-note" id="menuEmptyNote" style="display:none">
+                    No restaurants within 5 miles match that search. Try a different term or remove the dietary filter.
+                </p>
+            </div>
+        </div>
+
+    </div>
+</section>
+
 <!-- ═══════════════════════  RIDER MODE  ════════════════════════════════ -->
 <section class="rider-section">
     <div class="container">
@@ -478,7 +662,7 @@ GEOSEARCH restaurants:geo
 <footer class="site-footer">
     <div class="container">
         <p>SimpleLocator · Spring Boot 3.2 · PostgreSQL 16 · PostGIS 3.4 · Redis 7 · Hibernate Spatial 6.4</p>
-        <p class="footer-sub">pgAdmin → <code>http://localhost:5050</code> &nbsp;|&nbsp; REST → <code>/api/restaurants/search/compare</code> &nbsp;|&nbsp; Rider → <code>/api/rider/update</code> &nbsp;|&nbsp; SSE → <code>/api/rider/stream</code></p>
+        <p class="footer-sub">pgAdmin → <code>http://localhost:5050</code> &nbsp;|&nbsp; REST → <code>/api/restaurants/search/compare</code> &nbsp;|&nbsp; Menu → <code>/api/restaurants/search/menu</code> &nbsp;|&nbsp; Rider → <code>/api/rider/update</code> &nbsp;|&nbsp; SSE → <code>/api/rider/stream</code></p>
     </div>
 </footer>
 

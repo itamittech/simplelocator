@@ -13,7 +13,11 @@ fundamentally different data structures.
 | **GiST** | PostgreSQL | R-tree | `ST_DWithin` | General spatial queries |
 | **SP-GiST** | PostgreSQL | Quadtree | `&&` (bbox overlap) | Uniform point data |
 | **Geohash** | PostgreSQL | B-tree (string prefix) | `LIKE 'prefix%'` | Any string-indexed store |
-| **Redis GEO** | Redis | Sorted Set (geohash score) | `GEORADIUS` | Real-time location tracking |
+| **GIN/tsvector** | PostgreSQL | Inverted index (lexeme → posting list) | `@@` (matches) | Full-text search on menu items |
+| **GIN/JSONB** | PostgreSQL | Inverted index (path → value set) | `@>` (contains) | Structured document queries |
+| **Redis GEO** | Redis | Sorted Set (geohash score) | `GEOSEARCH` | Real-time location tracking |
+
+The **Menu Search** endpoint combines GiST + GIN (FTS) + GIN (JSONB) in a **single SQL query** — three different index types intersecting their results to answer "restaurants within 5 miles that serve *pasta* and are *vegetarian*".
 
 ---
 
@@ -67,6 +71,111 @@ Precision 9: 'dr5reuueb'   → ~4.4  m  × 4.4  m   ← stored precision
 
 ---
 
+### 4. GIN — Full-Text Search (tsvector)
+
+```
+menu_search_vector (tsvector):
+
+Lexeme        →  Posting List (row IDs)
+──────────────────────────────────────
+'pasta'       →  { 19 }           ← Battello
+'pizza'       →  { 1, 11, 12, 19 }
+'miso'        →  { 8 }            ← Nobu
+'curry'       →  { 16, 18 }
+'dumpl'       →  { 17 }           ← Nan Xiang (stemmed)
+```
+
+GIN (Generalized Inverted Index) maps each **stemmed lexeme** (word root) to a list of row IDs containing that word. A text search is a lookup in this map — O(log N + K) where K is the result count.
+
+- The `menu_search_vector` column is a pre-computed `tsvector` covering restaurant name + cuisine + all menu item names + descriptions.
+- `plainto_tsquery('english', 'pasta')` parses the user's phrase into a tsquery, applying the same stemming rules as the tsvector.
+- `@@` (matches) operator: `menu_search_vector @@ plainto_tsquery('english', 'pasta')` — GIN looks up `'pasta'` in the index and returns its posting list in one page read.
+- Results are ranked by `ts_rank()` — term frequency × positional weight.
+- **Best for**: document search, menu/catalogue search, any unstructured text.
+
+```sql
+-- GIN index creation:
+CREATE INDEX idx_restaurants_menu_fts ON restaurants USING GIN(menu_search_vector);
+
+-- Query pattern:
+WHERE menu_search_vector @@ plainto_tsquery('english', 'pasta')
+ORDER BY ts_rank(menu_search_vector, plainto_tsquery('english', 'pasta')) DESC
+```
+
+---
+
+### 5. GIN — JSONB Document Index
+
+```json
+{
+  "items": [
+    { "name": "Veggie Ramen", "price": 19.00, "dietary": ["vegetarian","vegan"] },
+    { "name": "Pork Ramen",   "price": 21.00, "dietary": [] }
+  ],
+  "dietary_options": ["vegetarian", "vegan"],
+  "price_range": "$$"
+}
+```
+
+When you create a GIN index on a JSONB column, PostgreSQL decomposes every document into its constituent key-value paths and indexes them individually. The result is an inverted index over the document structure itself.
+
+- `@>` (containment): `menu @> '{"dietary_options":["vegetarian"]}'` — returns rows whose menu document contains the right-hand side as a subset.
+- GIN indexes every path and value: `dietary_options`, `dietary_options[0]`, etc.
+- Empty object `'{}'::jsonb` is contained by everything — use it as a "no filter" sentinel.
+- **Best for**: flexible schema queries, tag/label searches, nested document filtering.
+
+```sql
+-- GIN index creation:
+CREATE INDEX idx_restaurants_menu_jsonb ON restaurants USING GIN(menu);
+
+-- Query pattern (dietary filter):
+WHERE menu @> '{"dietary_options":["vegetarian"]}'::jsonb
+
+-- No filter (matches all):
+WHERE menu @> '{}'::jsonb        -- always true
+```
+
+---
+
+### 6. The Combined Query — GiST + GIN + GIN
+
+This is where it comes together. A single SQL statement activates **three separate indexes**:
+
+```sql
+SELECT r.id, r.name, r.cuisine, r.menu,
+       ts_rank(r.menu_search_vector, plainto_tsquery('english', :query)) AS rank,
+       ST_Distance(CAST(r.location_gist AS geography), ST_MakePoint(:lng,:lat)) AS dist_m
+FROM restaurants r
+WHERE
+    -- ① GiST R-tree: prune by location (only rows within 5 miles)
+    ST_DWithin(
+        CAST(r.location_gist AS geography),
+        ST_SetSRID(ST_MakePoint(:lng, :lat), 4326),
+        8046.72
+    )
+    -- ② GIN inverted index: prune by menu text (only rows matching query)
+    AND r.menu_search_vector @@ plainto_tsquery('english', :query)
+
+    -- ③ GIN JSONB index: prune by dietary requirement
+    AND r.menu @> CAST(:dietary AS jsonb)
+
+ORDER BY rank DESC, dist_m ASC   -- most relevant first, then closest
+```
+
+PostgreSQL's **bitmap scan** mechanism intersects the row sets from each index independently:
+
+```
+GiST result set:      { 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20 }
+GIN/FTS result set:   { 19, 7, 4, 11 }   (rows with "pasta" or "vegetable")
+GIN/JSONB result set: { 4, 7, 10, 11, 16, 19 }   (vegetarian menu)
+                       ───────────────────────
+Intersection:         { 7, 11, 19 }
+```
+
+Only the intersection is fetched from the heap — rows that are nearby *and* relevant *and* match the dietary filter.
+
+---
+
 ## Tech Stack
 
 | Component | Technology |
@@ -111,13 +220,17 @@ This starts:
 ```
 
 On first boot, Flyway automatically runs:
-1. `V1` — enables the PostGIS extension and creates the `restaurants` table
+1. `V1` — enables PostGIS extension and creates the `restaurants` table
 2. `V2` — creates GiST, SP-GiST, and B-tree (geohash) indexes
 3. `V3` — inserts 23 sample NYC-area restaurants
+4. `V4` — creates `delivery_zones` table with PostGIS Polygon column
+5. `V5` — inserts 3 Manhattan/Brooklyn delivery zones
+6. `V6` — adds `menu` JSONB column + `menu_search_vector` tsvector + two GIN indexes
+7. `V7` — populates realistic menu JSONB for all 23 restaurants and computes tsvector
 
 Expected output:
 ```
-Successfully applied 3 migrations to schema "public"
+Successfully applied 7 migrations to schema "public"
 Started SimpleLocatorApplication in 3.7 seconds
 ```
 
@@ -153,6 +266,52 @@ All endpoints accept a `POST` body with the user's current coordinates:
 | `POST` | `/api/restaurants/search/geohash` | Geohash B-tree |
 | `POST` | `/api/restaurants/search/compare` | All three at once |
 | `POST` | `/api/restaurants/search/debug` | Map visualization metadata |
+| `POST` | `/api/restaurants/search/menu` | **GiST + GIN (FTS) + GIN (JSONB)** combined |
+
+**Menu search request body:**
+```json
+{
+  "latitude":  40.7128,
+  "longitude": -74.0060,
+  "query":     "pasta",
+  "dietary":   "vegetarian"
+}
+```
+
+`dietary` is optional. Accepted values: `vegetarian`, `vegan`, `gluten-free`, `halal`, `kosher`.
+Omit or pass `null` to search all restaurants regardless of dietary options.
+
+**Menu search response shape:**
+```json
+{
+  "centerLat": 40.7128, "centerLng": -74.006, "radiusMeters": 8046.72,
+  "query": "pasta", "dietaryFilter": "vegetarian",
+  "resultCount": 2, "executionTimeMs": 12,
+  "indexesUsed": "GiST (location) + GIN/tsvector (FTS) + GIN/JSONB (dietary)",
+  "restaurants": [
+    {
+      "id": 19, "name": "Battello", "cuisine": "Italian",
+      "distanceMiles": 3.21, "relevanceScore": 0.076,
+      "priceRange": "$$$",
+      "dietaryOptions": ["vegetarian", "gluten-free"],
+      "items": [
+        {
+          "name": "Wild Mushroom Risotto",
+          "description": "Arborio rice with wild mushrooms, white wine, and truffle oil",
+          "price": 28.00,
+          "dietary": ["vegetarian", "gluten-free"]
+        }
+      ]
+    }
+  ]
+}
+```
+
+```bash
+curl -X POST http://localhost:8080/api/restaurants/search/menu \
+  -H "Content-Type: application/json" \
+  -d '{"latitude":40.7128,"longitude":-74.0060,"query":"pasta","dietary":"vegetarian"}'
+```
 
 ### Redis GEO endpoints (Rider mode, 2-mile search)
 
@@ -482,7 +641,7 @@ The browser simulates a rider moving through 14 Manhattan waypoints (Financial D
 ## Verify Indexes in pgAdmin
 
 ```sql
--- Confirm all three indexes exist
+-- Confirm all five indexes exist
 SELECT indexname, indexdef
 FROM pg_indexes
 WHERE tablename = 'restaurants'
@@ -495,7 +654,31 @@ Expected:
 |-----------|----------|
 | `idx_restaurants_geohash` | `CREATE INDEX ... USING btree (geohash)` |
 | `idx_restaurants_gist` | `CREATE INDEX ... USING gist (location_gist)` |
+| `idx_restaurants_menu_fts` | `CREATE INDEX ... USING gin (menu_search_vector)` |
+| `idx_restaurants_menu_jsonb` | `CREATE INDEX ... USING gin (menu)` |
 | `idx_restaurants_spgist` | `CREATE INDEX ... USING spgist (location_spgist)` |
+
+```sql
+-- Inspect GIN index internals — tsvector entries for Battello
+SELECT to_tsvector('english', name || ' ' || cuisine) AS vec
+FROM restaurants WHERE name = 'Battello';
+-- 'battello':1 'italian':2
+
+-- Inspect menu JSONB document
+SELECT menu FROM restaurants WHERE name = 'Battello';
+
+-- Test dietary containment manually
+SELECT name FROM restaurants
+WHERE menu @> '{"dietary_options":["vegetarian"]}'::jsonb;
+
+-- Full combined query test
+SELECT name,
+       ts_rank(menu_search_vector, plainto_tsquery('english','pasta')) AS rank
+FROM restaurants
+WHERE menu_search_vector @@ plainto_tsquery('english','pasta')
+  AND menu @> '{"dietary_options":["vegetarian"]}'::jsonb
+ORDER BY rank DESC;
+```
 
 ---
 
@@ -541,17 +724,49 @@ WHERE geohash LIKE 'dr5r%'
    OR geohash LIKE 'dr5x%';
 ```
 
+### Combined GiST + GIN + GIN — should show three index types
+
+```sql
+EXPLAIN ANALYZE
+SELECT name,
+       ts_rank(menu_search_vector, plainto_tsquery('english', 'pizza')) AS rank
+FROM restaurants
+WHERE ST_DWithin(
+        CAST(location_gist AS geography),
+        CAST(ST_SetSRID(ST_MakePoint(-74.0060, 40.7128), 4326) AS geography),
+        8046.72
+      )
+  AND menu_search_vector @@ plainto_tsquery('english', 'pizza')
+  AND menu @> '{"dietary_options":["vegetarian"]}'::jsonb
+ORDER BY rank DESC;
+```
+
+Expected plan excerpt:
+```
+Bitmap Heap Scan on restaurants
+  Recheck Cond: (menu_search_vector @@ ...) AND (menu @> ...)
+  Filter: ST_DWithin(CAST(location_gist AS geography), ...)
+  ->  BitmapAnd
+        ->  Bitmap Index Scan on idx_restaurants_menu_fts
+        ->  Bitmap Index Scan on idx_restaurants_menu_jsonb
+```
+
+PostgreSQL generates a `BitmapAnd` — bitwise-AND of the posting lists from both GIN indexes — then applies the GiST spatial filter on the small survivor set.
+
 ---
 
 ## Key Constants
 
 | Constant | Value | Notes |
 |----------|-------|-------|
-| Search radius | **5 miles = 8,046.72 m** | Used in all three strategies |
+| Search radius | **5 miles = 8,046.72 m** | Used in all strategies |
 | SP-GiST buffer | **0.09°** | ~10 km, covers search circle at any latitude |
 | Geohash search precision | **4 chars** | Cell ≈ 39×20 km, safe outer bound for 8 km radius |
 | Geohash stored precision | **9 chars** | Cell ≈ 4m×5m, high accuracy for storage |
 | Neighbors checked | **9 cells** | Center + 8 adjacent cells |
+| GIN tsvector language | **english** | Applies Porter stemming: "pasta" → 'pasta', "pastas" → 'pasta' |
+| JSONB no-filter sentinel | **`{}`** | Empty object `@>` any JSONB → always true |
+| Dietary filter format | `{"dietary_options":["X"]}` | Containment check against menu's dietary_options array |
 
 ---
 

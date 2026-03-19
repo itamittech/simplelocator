@@ -87,9 +87,26 @@ The frontend (`app.js`) uses this response to render three Leaflet map tabs show
 
 `RestaurantService.mapRow(Object[] row)` maps native query results by positional index. Column order in all three SELECT statements must stay consistent: `id[0], name[1], address[2], cuisine[3], latitude[4], longitude[5], location_gist[6], location_spgist[7], geohash[8], dist_meters[9]`.
 
+### GIN Index + JSONB Menu Search
+
+A fourth index strategy (`/api/restaurants/search/menu`) combines three PostgreSQL index types in one query:
+
+| Index | Column | Operator | Purpose |
+|---|---|---|---|
+| GiST (R-tree) | `location_gist` | `ST_DWithin` | Proximity filter (existing) |
+| GIN (tsvector) | `menu_search_vector` | `@@` (matches) | Full-text search on menu item names+descriptions |
+| GIN (JSONB) | `menu` | `@>` (contains) | Dietary option filter on JSONB document |
+
+- `menu` is a JSONB column with shape `{"items":[{name, description, price, dietary:[...]}], "dietary_options":[...], "price_range":"$$"}`
+- `menu_search_vector` is a `TSVECTOR` computed from restaurant name + cuisine + all menu item text
+- Dietary filter uses JSONB containment: `'{}'::jsonb` matches everything (empty object is contained in any JSONB)
+- **IMPORTANT:** Use `SELECT r.col1, r.col2, ...` explicit columns in all native queries — never `SELECT r.*` since new columns (menu, menu_search_vector) shift the `Object[]` positional indices used in `mapRow()`
+
 ### Database Schema
 
 Managed by Flyway (`ddl-auto: validate` — Hibernate never modifies the schema):
 - `V1` — creates `restaurants` table with `location_gist`, `location_spgist` geometry columns and `geohash` varchar
 - `V2` — creates the three indexes (GiST, SP-GiST, B-tree)
 - `V3` — inserts 23 NYC-area sample restaurants; geometry values use `ST_SetSRID(ST_MakePoint(lng,lat),4326)`, geohash via `ST_GeoHash(...,9)`
+- `V6` — adds `menu` JSONB column + `menu_search_vector` TSVECTOR + two GIN indexes
+- `V7` — populates menu JSONB for all 23 restaurants + computes tsvector via `to_tsvector('english', ...)`

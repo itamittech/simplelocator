@@ -3,6 +3,8 @@ package com.example.simplelocator.service;
 import com.example.simplelocator.dto.*;
 import com.example.simplelocator.entity.Restaurant;
 import com.example.simplelocator.repository.RestaurantRepository;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -25,6 +27,7 @@ public class RestaurantService {
 
     private final RestaurantRepository restaurantRepository;
     private final GeohashService       geohashService;
+    private final ObjectMapper         objectMapper;
 
     // ──────────────────────────────────────────────────────────────────────────
     // 1. GiST (R-tree)
@@ -293,5 +296,105 @@ public class RestaurantService {
         if (o instanceof Number n)    return n.longValue();
         if (o instanceof BigInteger b) return b.longValue();
         return 0L;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 4. Combined GIS + GIN (FTS) + GIN (JSONB) — Menu Search
+    //
+    //    One query hits three different PostgreSQL index types:
+    //      ① GiST   — ST_DWithin proximity (location_gist)
+    //      ② GIN    — tsvector @@ plainto_tsquery full-text search (menu_search_vector)
+    //      ③ GIN    — JSONB @> containment filter (menu column, dietary_options)
+    // ──────────────────────────────────────────────────────────────────────────
+    public MenuSearchResponse searchMenu(MenuSearchRequest req) {
+        if (req.getQuery() == null || req.getQuery().isBlank()) {
+            return MenuSearchResponse.builder()
+                    .centerLat(req.getLatitude()).centerLng(req.getLongitude())
+                    .radiusMeters(SEARCH_RADIUS_METERS).query("").dietaryFilter("")
+                    .resultCount(0).executionTimeMs(0)
+                    .indexesUsed("GiST (location) + GIN/tsvector (FTS) + GIN/JSONB (dietary)")
+                    .restaurants(List.of())
+                    .build();
+        }
+
+        // Build JSONB dietary filter: '{}' matches everything (empty object is contained by any JSONB)
+        String dietaryJson = "{}";
+        String dietaryLabel = "none";
+        if (req.getDietary() != null && !req.getDietary().isBlank()) {
+            dietaryJson  = String.format("{\"dietary_options\":[\"%s\"]}", req.getDietary().trim());
+            dietaryLabel = req.getDietary().trim();
+        }
+
+        long start = System.currentTimeMillis();
+        List<Object[]> rows = restaurantRepository.searchMenuCombined(
+                req.getLatitude(), req.getLongitude(), SEARCH_RADIUS_METERS,
+                req.getQuery().trim(), dietaryJson);
+        long elapsed = System.currentTimeMillis() - start;
+
+        List<MenuSearchResult> results = rows.stream().map(this::mapMenuRow).toList();
+
+        return MenuSearchResponse.builder()
+                .centerLat(req.getLatitude()).centerLng(req.getLongitude())
+                .radiusMeters(SEARCH_RADIUS_METERS)
+                .query(req.getQuery().trim())
+                .dietaryFilter(dietaryLabel)
+                .resultCount(results.size())
+                .executionTimeMs(elapsed)
+                .indexesUsed("GiST (location) + GIN/tsvector (FTS) + GIN/JSONB (dietary)")
+                .restaurants(results)
+                .build();
+    }
+
+    /**
+     * Maps a row from searchMenuCombined to MenuSearchResult.
+     * Column order: [0]id [1]name [2]address [3]cuisine [4]lat [5]lng
+     *               [6]location_gist [7]location_spgist [8]geohash
+     *               [9]menu(JSONB) [10]rank [11]dist_meters
+     */
+    private MenuSearchResult mapMenuRow(Object[] row) {
+        String menuJson = row[9] != null ? row[9].toString() : "{}";
+        double rank      = toDouble(row[10]);
+        double distM     = toDouble(row[11]);
+        double distMiles = Math.round(distM / MILES_TO_METERS * 100.0) / 100.0;
+
+        List<MenuItemDto> items         = new ArrayList<>();
+        List<String>      dietaryOpts   = new ArrayList<>();
+        String            priceRange    = "";
+
+        try {
+            JsonNode menu = objectMapper.readTree(menuJson);
+            if (menu.has("items")) {
+                for (JsonNode item : menu.get("items")) {
+                    List<String> dietary = new ArrayList<>();
+                    if (item.has("dietary")) {
+                        item.get("dietary").forEach(d -> dietary.add(d.asText()));
+                    }
+                    items.add(MenuItemDto.builder()
+                            .name(item.path("name").asText())
+                            .description(item.path("description").asText())
+                            .price(item.path("price").asDouble())
+                            .dietary(dietary)
+                            .build());
+                }
+            }
+            if (menu.has("dietary_options")) {
+                menu.get("dietary_options").forEach(d -> dietaryOpts.add(d.asText()));
+            }
+            if (menu.has("price_range")) {
+                priceRange = menu.get("price_range").asText();
+            }
+        } catch (Exception e) {
+            log.warn("Failed to parse menu JSON for row: {}", e.getMessage());
+        }
+
+        return MenuSearchResult.builder()
+                .id(toLong(row[0])).name((String) row[1]).address((String) row[2])
+                .cuisine((String) row[3]).latitude(toDouble(row[4])).longitude(toDouble(row[5]))
+                .distanceMiles(distMiles)
+                .relevanceScore(Math.round(rank * 1000.0) / 1000.0)
+                .priceRange(priceRange)
+                .dietaryOptions(dietaryOpts)
+                .items(items)
+                .build();
     }
 }

@@ -12,6 +12,11 @@ import java.util.List;
  * NOTE: Spring Data JPA parses ":name" as a named parameter inside native queries.
  * The PostgreSQL cast operator "::" would be mis-parsed as ":"+":geography" and
  * break the query. All casts therefore use ANSI SQL  CAST(expr AS type)  instead.
+ *
+ * NOTE: All SELECT clauses use explicit column lists rather than SELECT r.* so that
+ * mapRow() positional indices remain stable regardless of new columns added to the table.
+ * Column order contract: [0]id [1]name [2]address [3]cuisine [4]lat [5]lng
+ *                        [6]location_gist [7]location_spgist [8]geohash [9]dist_meters
  */
 @Repository
 public interface RestaurantRepository extends JpaRepository<Restaurant, Long> {
@@ -23,7 +28,8 @@ public interface RestaurantRepository extends JpaRepository<Restaurant, Long> {
     //    Index used: USING GIST (location_gist)
     // -------------------------------------------------------------------------
     @Query(value = """
-            SELECT r.*,
+            SELECT r.id, r.name, r.address, r.cuisine, r.latitude, r.longitude,
+                   r.location_gist, r.location_spgist, r.geohash,
                    ST_Distance(
                        CAST(r.location_gist AS geography),
                        CAST(ST_SetSRID(ST_MakePoint(:lng, :lat), 4326) AS geography)
@@ -51,7 +57,8 @@ public interface RestaurantRepository extends JpaRepository<Restaurant, Long> {
     //    Index used: USING SPGIST (location_spgist)
     // -------------------------------------------------------------------------
     @Query(value = """
-            SELECT r.*,
+            SELECT r.id, r.name, r.address, r.cuisine, r.latitude, r.longitude,
+                   r.location_gist, r.location_spgist, r.geohash,
                    ST_Distance(
                        CAST(r.location_spgist AS geography),
                        CAST(ST_SetSRID(ST_MakePoint(:lng, :lat), 4326) AS geography)
@@ -80,7 +87,8 @@ public interface RestaurantRepository extends JpaRepository<Restaurant, Long> {
     //    Index used: B-tree on geohash column
     // -------------------------------------------------------------------------
     @Query(value = """
-            SELECT r.*,
+            SELECT r.id, r.name, r.address, r.cuisine, r.latitude, r.longitude,
+                   r.location_gist, r.location_spgist, r.geohash,
                    ST_Distance(
                        CAST(r.location_gist AS geography),
                        CAST(ST_SetSRID(ST_MakePoint(:lng, :lat), 4326) AS geography)
@@ -117,5 +125,48 @@ public interface RestaurantRepository extends JpaRepository<Restaurant, Long> {
             @Param("p6") String p6,
             @Param("p7") String p7,
             @Param("p8") String p8
+    );
+
+    // -------------------------------------------------------------------------
+    // 4. Combined GIS + GIN (FTS) + GIN (JSONB) Query
+    //
+    //    Three PostgreSQL index types in a single query:
+    //
+    //    ① GiST index  (location_gist)   — ST_DWithin proximity filter
+    //    ② GIN index   (menu_search_vec) — tsvector @@ plainto_tsquery FTS filter
+    //    ③ GIN index   (menu JSONB)      — @> containment filter on dietary_options
+    //
+    //    Column order: [0]id [1]name [2]address [3]cuisine [4]lat [5]lng
+    //                  [6]location_gist [7]location_spgist [8]geohash
+    //                  [9]menu [10]rank [11]dist_meters
+    //
+    //    Pass :dietary = '{}' to match all restaurants (empty object is contained
+    //    in any JSONB object), or '{"dietary_options":["vegetarian"]}' to filter.
+    // -------------------------------------------------------------------------
+    @Query(value = """
+            SELECT r.id, r.name, r.address, r.cuisine, r.latitude, r.longitude,
+                   r.location_gist, r.location_spgist, r.geohash,
+                   r.menu,
+                   ts_rank(r.menu_search_vector, plainto_tsquery('english', :query)) AS rank,
+                   ST_Distance(
+                       CAST(r.location_gist AS geography),
+                       ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)
+                   ) AS dist_meters
+            FROM restaurants r
+            WHERE ST_DWithin(
+                      CAST(r.location_gist AS geography),
+                      ST_SetSRID(ST_MakePoint(:lng, :lat), 4326),
+                      :radiusMeters
+                  )
+              AND r.menu_search_vector @@ plainto_tsquery('english', :query)
+              AND r.menu @> CAST(:dietary AS jsonb)
+            ORDER BY rank DESC, dist_meters ASC
+            """, nativeQuery = true)
+    List<Object[]> searchMenuCombined(
+            @Param("lat") double lat,
+            @Param("lng") double lng,
+            @Param("radiusMeters") double radiusMeters,
+            @Param("query") String query,
+            @Param("dietary") String dietary
     );
 }

@@ -16,12 +16,18 @@
    - 4.2 [SP-GiST — Quadtree Index](#42-sp-gist--quadtree-index)
    - 4.3 [Geohash — B-tree Index](#43-geohash--b-tree-index)
    - 4.4 [Index Comparison](#44-index-comparison)
-5. [Redis GEO Architecture](#5-redis-geo-architecture)
-6. [Geofencing with PostGIS](#6-geofencing-with-postgis)
-7. [SSE Real-Time Event Stream](#7-sse-real-time-event-stream)
-8. [Complete Rider Event Flow](#8-complete-rider-event-flow)
-9. [PostGIS Function Reference](#9-postgis-function-reference)
-10. [System Design Tradeoffs](#10-system-design-tradeoffs)
+5. [GIN Index Deep Dive](#5-gin-index-deep-dive)
+   - 5.1 [What is a GIN Index?](#51-what-is-a-gin-index)
+   - 5.2 [GIN for Full-Text Search — tsvector](#52-gin-for-full-text-search--tsvector)
+   - 5.3 [GIN for JSONB — Document Containment](#53-gin-for-jsonb--document-containment)
+   - 5.4 [Combined GiST + GIN + GIN Query](#54-combined-gist--gin--gin-query)
+   - 5.5 [GIN vs GiST for Text/JSON](#55-gin-vs-gist-for-textjson)
+6. [Redis GEO Architecture](#6-redis-geo-architecture)
+7. [Geofencing with PostGIS](#7-geofencing-with-postgis)
+8. [SSE Real-Time Event Stream](#8-sse-real-time-event-stream)
+9. [Complete Rider Event Flow](#9-complete-rider-event-flow)
+10. [PostGIS Function Reference](#10-postgis-function-reference)
+11. [System Design Tradeoffs](#11-system-design-tradeoffs)
 
 ---
 
@@ -418,26 +424,362 @@ This is why we always query center + 8 neighbors. Querying only 1 cell would mis
 
 ### 4.4 Index Comparison
 
-| Dimension              | GiST (R-tree)         | SP-GiST (Quadtree)     | Geohash (B-tree)           |
-|------------------------|-----------------------|------------------------|----------------------------|
-| **Index structure**    | Hierarchical MBRs     | Space partitioning     | String prefix tree          |
-| **Overlap**            | MBRs can overlap      | No overlap             | No overlap                  |
-| **Optimal data**       | Clustered / irregular | Uniform distribution   | Any — works in any DB       |
-| **Query type**         | ST_DWithin (native)   | && + ST_DWithin        | LIKE prefix + Haversine     |
-| **Distance unit**      | Metres (geography)    | Metres (geography)     | Java-side Haversine         |
-| **False positives**    | Minimal               | Square-circle corners  | Cell boundary corners       |
-| **Portability**        | PostGIS only          | PostGIS only           | MySQL, DynamoDB, Redis, etc.|
-| **Update cost**        | Higher (MBR rebalance)| Lower                  | Lowest (string update)      |
-| **Works without PostGIS**| No                 | No                     | Yes                         |
+| Dimension              | GiST (R-tree)         | SP-GiST (Quadtree)     | Geohash (B-tree)            | GIN (tsvector/JSONB)            |
+|------------------------|-----------------------|------------------------|-----------------------------|---------------------------------|
+| **Index structure**    | Hierarchical MBRs     | Space partitioning     | String prefix tree          | Inverted (element → row list)   |
+| **Overlap**            | MBRs can overlap      | No overlap             | No overlap                  | N/A — not a spatial structure   |
+| **Optimal data**       | Clustered / irregular | Uniform distribution   | Any — works in any DB       | Multi-valued text / documents   |
+| **Primary operator**   | `ST_DWithin`          | `&&` + `ST_DWithin`    | `LIKE prefix%` + Haversine  | `@@` (text), `@>` (JSONB)       |
+| **Distance unit**      | Metres (geography)    | Metres (geography)     | Java-side Haversine         | N/A                             |
+| **False positives**    | Minimal               | Square-circle corners  | Cell boundary corners       | Yes (pending list, recheck)     |
+| **Read performance**   | Fast for spatial      | Fast for uniform pts   | Fast prefix scan            | Fastest for exact element match |
+| **Write performance**  | Medium                | Medium-fast            | Fast                        | Slowest (pending list flush)    |
+| **Portability**        | PostGIS only          | PostGIS only           | MySQL, DynamoDB, Redis, etc.| PostgreSQL (tsvector/JSONB)     |
+| **Works without PostGIS**| No                 | No                     | Yes                         | Yes (no spatial extension needed)|
+| **Use case**           | Any spatial query     | Uniform point clouds   | Cross-DB portability        | FTS, document/tag queries       |
 
 **When to use each in production:**
-- **GiST** — default choice for all PostGIS workloads; handles polygons, lines, irregular point clouds
+- **GiST** — default choice for all PostGIS spatial workloads; handles polygons, lines, irregular point clouds
 - **SP-GiST** — prefer when points are uniformly distributed and writes are infrequent
 - **Geohash** — when you need portability across databases, or when the DB has no spatial extension
+- **GIN/tsvector** — any full-text search requirement: menus, product descriptions, documents
+- **GIN/JSONB** — flexible schema filtering, tag/label queries, multi-attribute faceted search
 
 ---
 
-## 5. Redis GEO Architecture
+## 5. GIN Index Deep Dive
+
+### 5.1 What is a GIN Index?
+
+**GIN** (Generalized Inverted Index) is PostgreSQL's inverted index framework. Like GiST, it is a generic index structure that can be specialized for different data types. The two most important specializations are:
+
+1. **GIN on `tsvector`** — full-text search: maps stemmed words to the rows that contain them
+2. **GIN on `jsonb`** — document queries: maps every JSONB key/value path to the rows that contain it
+
+The core data structure is the same for both: an **inverted index** where each unique *element* points to a *posting list* of row IDs:
+
+```
+Element (key)     →    Posting List (heap page refs)
+──────────────────────────────────────────────────────
+'pasta'           →    { page 3 item 2, page 7 item 1 }    ← tsvector lexeme
+'pizza'           →    { page 1 item 1, page 6 item 4, page 7 item 2, ... }
+"dietary_options" →    { all rows with that JSONB key }     ← JSONB path
+["vegetarian"]    →    { rows where dietary_options contains "vegetarian" }
+```
+
+**Read performance:** Looking up a lexeme or JSONB key is `O(log N)` (B-tree scan of the element dictionary). Fetching the posting list is `O(K)` where K = number of matching rows. For selective queries this is extremely fast.
+
+**Write performance:** Every `INSERT` or `UPDATE` must add the new row to every posting list for every element in the new value. GIN uses a **pending list** (a small sorted list on the heap) to batch these updates; a `VACUUM` or background worker flushes the pending list into the main GIN structure. This makes GIN writes slower than GiST but reads faster for text/JSON workloads.
+
+---
+
+### 5.2 GIN for Full-Text Search — tsvector
+
+#### tsvector and tsquery
+
+A `tsvector` is a pre-processed, normalized representation of a text document:
+
+```sql
+SELECT to_tsvector('english',
+  'Slow-cooked beef ragù with egg pasta and aged Parmigiano');
+-- Result:
+-- 'age':9 'beef':3 'cook':2 'egg':7 'parmigiano':10 'pasta':8 'ragù':4 'slow':1
+
+-- Observations:
+--   "slow-cooked" → 'slow':1 'cook':2   (compound split + stemmed)
+--   "pasta"       → 'pasta':8           (already a root form)
+--   "Parmigiano"  → 'parmigiano':10     (lowercased)
+--   "with", "and" → removed             (stop words stripped)
+--   "aged"        → 'age':9             (stemmed: aged → age)
+```
+
+A `tsquery` is the query side:
+
+```sql
+SELECT plainto_tsquery('english', 'pasta vegetarian');
+-- Result: 'pasta' & 'vegetarian'  (AND by default for plain text)
+
+SELECT to_tsquery('english', 'pasta | pizza');
+-- Result: 'pasta' | 'pizza'       (OR — advanced syntax)
+```
+
+The `@@` operator checks if a tsvector matches a tsquery:
+
+```sql
+SELECT 'pasta':1 & 'beef':2 @@ to_tsquery('pasta');   -- TRUE
+SELECT 'pizza':1             @@ to_tsquery('pasta');   -- FALSE
+```
+
+#### How the GIN index is used
+
+```
+Query: menu_search_vector @@ plainto_tsquery('english', 'pasta')
+
+1. Parse query: 'pasta'
+2. Descend GIN B-tree → find entry for 'pasta'
+3. Read posting list: { row 19 (Battello) }
+4. Heap fetch: load row 19, verify with recheck
+5. Return: Battello
+```
+
+The GIN index never touches rows that don't contain 'pasta'. For a table with 1 million restaurants, only the rows in the posting list are ever fetched.
+
+#### tsvector column design in this project
+
+The `menu_search_vector` column is populated by V7:
+
+```sql
+UPDATE restaurants
+SET menu_search_vector = to_tsvector('english',
+    name || ' ' || COALESCE(cuisine, '') || ' ' ||
+    (SELECT string_agg(
+         item->>'name' || ' ' || COALESCE(item->>'description', ''),
+         ' '
+     )
+     FROM jsonb_array_elements(menu->'items') AS item
+    )
+)
+WHERE menu IS NOT NULL;
+```
+
+This covers **four layers of text** for each restaurant:
+- Restaurant `name` (e.g. "Nobu") — highest weight in ts_rank
+- `cuisine` (e.g. "Japanese") — cuisine-level discovery
+- Menu item `name` (e.g. "Black Cod Miso") — specific dish search
+- Menu item `description` (e.g. "flaky sweet and caramelized") — ingredient/descriptor search
+
+**In production**, a trigger would keep the column current:
+
+```sql
+CREATE FUNCTION update_menu_search_vector() RETURNS trigger AS $$
+BEGIN
+    NEW.menu_search_vector := to_tsvector('english',
+        NEW.name || ' ' || COALESCE(NEW.cuisine,'') || ' ' || ...);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_menu_search_vector
+BEFORE INSERT OR UPDATE ON restaurants
+FOR EACH ROW EXECUTE FUNCTION update_menu_search_vector();
+```
+
+#### ts_rank — Relevance Scoring
+
+`ts_rank(tsvector, tsquery)` returns a float in `[0, 1]` based on term frequency:
+
+```sql
+ts_rank(menu_search_vector, plainto_tsquery('english', 'pizza'))
+-- 0.075  ← "pizza" appears 1× in description
+-- 0.152  ← "pizza" appears 3× (name, cuisine, description)
+```
+
+The combined query orders by `ts_rank DESC, dist_meters ASC` — most relevant restaurants first, ties broken by proximity.
+
+---
+
+### 5.3 GIN for JSONB — Document Containment
+
+#### JSONB vs JSON
+
+PostgreSQL has two JSON storage types:
+
+| Feature | `json` | `jsonb` |
+|---------|--------|---------|
+| Storage | Raw text (preserves whitespace/order) | Binary decomposed |
+| Indexable | No (text only) | Yes (GIN) |
+| Operators | Limited | Full set: `@>`, `<@`, `?`, `?|`, `?&`, `#>` |
+| Read speed | Parse on every access | Parsed once at insert |
+| Write speed | Fast (text copy) | Slower (parse + decompose) |
+| **Use when** | Write-heavy, no queries | Query on document content |
+
+`jsonb` is the right choice whenever you need to query document internals.
+
+#### GIN index on JSONB — what it indexes
+
+When you `CREATE INDEX ... USING GIN(menu)`, PostgreSQL decomposes every JSONB document into its constituent *elements* and builds a posting list for each:
+
+```
+Document (row 10 — Momofuku):
+{
+  "items": [
+    {"name":"Pork Ramen", "price":21.0, "dietary":[]},
+    {"name":"Veggie Ramen","price":19.0,"dietary":["vegetarian","vegan"]}
+  ],
+  "dietary_options": ["vegetarian","vegan"],
+  "price_range": "$$"
+}
+
+GIN entries created:
+  "items"              → { row 10 }
+  "name"               → { row 10, ... }
+  "Pork Ramen"         → { row 10 }
+  "Veggie Ramen"       → { row 10 }
+  "dietary_options"    → { row 10, row 7, row 16, ... }
+  "vegetarian"         → { row 10, row 7, row 4, row 16, ... }
+  "vegan"              → { row 10, row 16, row 17, ... }
+  "price_range"        → { row 10, ... }
+  "$$"                 → { row 10, row 7, row 18, ... }
+```
+
+#### The `@>` (containment) operator
+
+`A @> B` returns true if A contains all the keys and values present in B:
+
+```sql
+-- Does Momofuku's menu contain dietary_options: ["vegetarian"]?
+'{"dietary_options":["vegetarian","vegan"]}'
+@> '{"dietary_options":["vegetarian"]}'
+-- TRUE — the left array includes "vegetarian"
+
+-- Array containment check — note: ORDER does NOT matter
+'["vegan","vegetarian"]' @> '["vegetarian"]'
+-- TRUE
+
+-- Key existence
+menu ? 'price_range'
+-- TRUE for all rows with a price_range key
+
+-- Multiple key existence
+menu ?& array['dietary_options','price_range']
+-- TRUE only for rows with BOTH keys
+```
+
+#### How `@>` uses the GIN index
+
+```
+Query: menu @> '{"dietary_options":["vegetarian"]}'::jsonb
+
+1. Decompose RHS into elements: {"dietary_options"}, {"vegetarian"}
+2. GIN lookup for "vegetarian" → posting list { rows 4,7,10,11,16,17,18,... }
+3. GIN lookup for "dietary_options" → posting list { rows 4,7,10,11,... }
+4. Intersect posting lists → candidate rows
+5. Heap recheck: verify exact containment (GIN is lossy — may have false positives)
+6. Return verified rows
+```
+
+#### The `{}` empty-object sentinel
+
+A key design decision in this project:
+
+```sql
+-- When no dietary filter is selected, pass '{}' not NULL:
+WHERE menu @> CAST(:dietary AS jsonb)
+
+-- With :dietary = '{}':
+menu @> '{}'    -- empty object is always contained in any object → always TRUE
+                -- GIN still uses the index, but the posting list = all rows
+
+-- With :dietary = '{"dietary_options":["vegetarian"]}':
+menu @> '{"dietary_options":["vegetarian"]}'   -- selective → GIN prunes heavily
+```
+
+This avoids a null-check branch in the SQL while keeping the query planner able to choose the optimal plan for both cases.
+
+---
+
+### 5.4 Combined GiST + GIN + GIN Query
+
+The `/api/restaurants/search/menu` endpoint runs a single SQL statement that activates three separate indexes:
+
+```sql
+SELECT r.id, r.name, r.address, r.cuisine, r.latitude, r.longitude,
+       r.location_gist, r.location_spgist, r.geohash,
+       r.menu,
+       ts_rank(r.menu_search_vector, plainto_tsquery('english', :query)) AS rank,
+       ST_Distance(
+           CAST(r.location_gist AS geography),
+           ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)
+       ) AS dist_meters
+FROM restaurants r
+WHERE
+    -- ① GiST R-tree — spatial proximity filter
+    ST_DWithin(
+        CAST(r.location_gist AS geography),
+        ST_SetSRID(ST_MakePoint(:lng, :lat), 4326),
+        :radiusMeters
+    )
+    -- ② GIN inverted index — full-text match on menu tsvector
+    AND r.menu_search_vector @@ plainto_tsquery('english', :query)
+    -- ③ GIN JSONB index — dietary containment check
+    AND r.menu @> CAST(:dietary AS jsonb)
+ORDER BY rank DESC, dist_meters ASC
+```
+
+#### Query planning — how PostgreSQL combines three indexes
+
+PostgreSQL's query planner uses **bitmap index scans** to combine multiple index results:
+
+```
+Step 1: Bitmap Scan — GIN (tsvector)
+        plainto_tsquery('english','pasta') → posting list → bitmap A
+        bitmap A marks rows { 19 } (Battello has pasta)
+
+Step 2: Bitmap Scan — GIN (JSONB)
+        @> '{"dietary_options":["vegetarian"]}' → posting list → bitmap B
+        bitmap B marks rows { 4, 7, 10, 11, 16, 17, 18, 19, ... }
+
+Step 3: BitmapAnd
+        bitmap A ∩ bitmap B = rows { 19 }
+
+Step 4: Heap Fetch on survivors
+        Load row 19 — recheck both GIN conditions (GIN is lossy)
+
+Step 5: Apply GiST spatial filter
+        ST_DWithin on location_gist for row 19
+        If within 5 miles → include in result
+```
+
+**EXPLAIN ANALYZE output (typical):**
+
+```
+Sort  (cost=4.50..4.51) (actual time=0.8..0.9 rows=2 loops=1)
+  Sort Key: (ts_rank(...)) DESC, dist_meters ASC
+  ->  Bitmap Heap Scan on restaurants
+        Recheck Cond: (menu_search_vector @@ ...) AND (menu @> ...)
+        Filter: ST_DWithin(CAST(location_gist AS geography), ...)
+        ->  BitmapAnd
+              ->  Bitmap Index Scan on idx_restaurants_menu_fts
+                    Index Cond: (menu_search_vector @@ ...)
+              ->  Bitmap Index Scan on idx_restaurants_menu_jsonb
+                    Index Cond: (menu @> ...)
+```
+
+The spatial filter is applied *after* the GIN intersection — because `ST_DWithin` is not free, and the GIN indexes are usually highly selective, reducing the candidate set before the spatial check.
+
+#### Filter selectivity — why ordering matters
+
+The planner estimates selectivity for each predicate and processes most selective first:
+
+| Predicate | Typical selectivity on 23-row dataset |
+|-----------|---------------------------------------|
+| `@@ plainto_tsquery('pasta')` | 1–4 rows (very selective) |
+| `@> '{"dietary_options":["vegetarian"]}'` | 8–12 rows (moderately selective) |
+| `ST_DWithin(..., 8046.72)` | 15–18 rows (low selectivity for Manhattan) |
+
+For this dataset, the GIN predicates do most of the pruning; the spatial filter is a final verify step. At scale (millions of restaurants globally), the spatial filter would become the dominant pruner.
+
+---
+
+### 5.5 GIN vs GiST for Text/JSON
+
+| Dimension | GIN | GiST |
+|-----------|-----|------|
+| **Index type** | Inverted (element → rows) | Hierarchical (tree of approximations) |
+| **Read speed** | Faster for exact lookups | Faster for range/nearest-neighbor |
+| **Write speed** | Slower (pending list + vacuum merge) | Faster (incremental MBR update) |
+| **Space** | Larger (one entry per unique element) | Smaller (bounded tree) |
+| **FTS operators** | `@@`, `@>`, `?`, `?&`, `?|` | `@@` only (via GiST opclass) |
+| **Spatial ops** | Not applicable | `&&`, `ST_DWithin`, `ST_Within`, ... |
+| **False positives** | Yes (posting list recheck required) | Yes (MBR/bbox recheck required) |
+| **Best for** | Text search, document containment, tag queries | Spatial queries, range queries, nearest-neighbor |
+
+**Rule of thumb:** Use GIN when your queries look up exact values or test containment. Use GiST when your queries compare ranges, distances, or shapes.
+
+---
+
+## 6. Redis GEO Architecture
+
 
 ### 5.1 Sorted Set as a Geo Index
 
@@ -524,9 +866,9 @@ This project combines both: Redis for sub-millisecond radius queries, PostGIS fo
 
 ---
 
-## 6. Geofencing with PostGIS
+## 7. Geofencing with PostGIS
 
-### 6.1 Delivery Zones as PostGIS Polygons
+### 7.1 Delivery Zones as PostGIS Polygons
 
 Zones are created as `GEOMETRY(Polygon, 4326)` using `ST_MakeEnvelope` (axis-aligned rectangles):
 
@@ -547,7 +889,7 @@ INSERT INTO delivery_zones (name, color, boundary) VALUES
 (-74.025, 40.700) ──────────────── (-73.965, 40.700)
 ```
 
-### 6.2 ST_Within — Point-in-Polygon Test
+### 7.2 ST_Within — Point-in-Polygon Test
 
 ```sql
 SELECT dz.* FROM delivery_zones dz
@@ -573,7 +915,7 @@ LIMIT 1;
 **Why GIST index on boundary?**
 `ST_Within` first performs a bounding-box overlap check (`&&`) which uses the GiST index, then the exact topology check. Without the index, every polygon is tested — O(n) full scan.
 
-### 6.3 Zone Crossing Detection — State Machine in RiderService
+### 7.3 Zone Crossing Detection — State Machine in RiderService
 
 ```java
 // In-memory state per rider (ConcurrentHashMap for thread safety)
@@ -596,9 +938,9 @@ This is a simple state machine with two states per zone per rider: INSIDE / OUTS
 
 ---
 
-## 7. SSE Real-Time Event Stream
+## 8. SSE Real-Time Event Stream
 
-### 7.1 Server-Sent Events vs Alternatives
+### 8.1 Server-Sent Events vs Alternatives
 
 | Transport       | Direction       | Protocol     | Use case                            |
 |-----------------|-----------------|--------------|--------------------------------------|
@@ -615,7 +957,7 @@ SSE is optimal here because:
 - Works over standard HTTP — no upgrade handshake like WebSocket
 - Simple Spring `SseEmitter` API
 
-### 7.2 EventStreamService — Fan-Out Design
+### 8.2 EventStreamService — Fan-Out Design
 
 ```java
 @Service
@@ -672,7 +1014,7 @@ event: LOCATION_UPDATE
 data: {"riderId":"rider-1","lat":40.741,"lng":-73.989,"zone":"Midtown Manhattan","nearbyCount":7}
 ```
 
-### 7.3 Event Types
+### 8.3 Event Types
 
 | Event Type          | Trigger Condition                                      | Payload                              |
 |---------------------|--------------------------------------------------------|--------------------------------------|
@@ -682,7 +1024,7 @@ data: {"riderId":"rider-1","lat":40.741,"lng":-73.989,"zone":"Midtown Manhattan"
 | `RIDER_ASSIGNED`    | Nearest restaurant ≤ 0.5 mi and was not assigned before| riderId, restaurantId, name, dist    |
 | `RIDER_UNASSIGNED`  | Was assigned, now nearest > 0.5 mi                     | riderId, prevRestaurantId            |
 
-### 7.4 Browser EventSource
+### 8.4 Browser EventSource
 
 ```javascript
 const source = new EventSource('/api/rider/stream');
@@ -703,7 +1045,7 @@ source.onerror = () => { /* optional error UI */ };
 
 ---
 
-## 8. Complete Rider Event Flow
+## 9. Complete Rider Event Flow
 
 The following sequence diagram shows one complete simulation tick — the full path from browser timer to SSE event delivery.
 
@@ -773,7 +1115,7 @@ This dual-channel design means the HTTP response is sufficient to keep one tab i
 
 ---
 
-## 9. PostGIS Function Reference
+## 10. PostGIS Function Reference
 
 ### Core Geometry Construction
 
@@ -937,9 +1279,9 @@ Index Scan using idx_restaurants_gist on restaurants
 
 ---
 
-## 10. System Design Tradeoffs
+## 11. System Design Tradeoffs
 
-### 10.1 Why In-Memory Cache Instead of Redis Hash?
+### 11.1 Why In-Memory Cache Instead of Redis Hash?
 
 The `restaurantCache` stores all 23 restaurant objects in the JVM heap. Alternatives:
 
@@ -951,7 +1293,7 @@ The `restaurantCache` stores all 23 restaurant objects in the JVM heap. Alternat
 
 For this scale (23 restaurants, rarely updated), JVM cache wins. At scale (millions of restaurants), a Redis Hash or a CDN-cached HTTP endpoint would be appropriate.
 
-### 10.2 ConcurrentHashMap vs Distributed State
+### 11.2 ConcurrentHashMap vs Distributed State
 
 Rider state (`riderZoneMap`, `riderAssignmentMap`) lives in a single JVM's `ConcurrentHashMap`. This works for one app instance.
 
@@ -968,14 +1310,14 @@ RiderService (A) publishes ──► Redis Pub/Sub ──► Instance B subscrib
                                                  broadcasts to [tab3]
 ```
 
-### 10.3 SSE Scalability Ceiling
+### 11.3 SSE Scalability Ceiling
 
 Each open SSE connection holds an HTTP thread (or a Servlet async context). With Tomcat's default 200 threads:
 - 200 concurrent SSE clients saturate the thread pool
 - Mitigation: Switch to reactive stack (`WebFlux` + `Flux<ServerSentEvent>`) — each SSE connection uses a tiny event loop task, not a thread
 - At very large scale, offload to a purpose-built push service (Pusher, Ably, Firebase Realtime DB)
 
-### 10.4 The `GEORADIUS` → `GEOSEARCH` Migration
+### 11.4 The `GEORADIUS` → `GEOSEARCH` Migration
 
 Redis deprecated `GEORADIUS` in Redis 6.2 (released 2021). The replacement `GEOSEARCH` command provides:
 - `FROMLONLAT` — search from a coordinate (equivalent to old GEORADIUS)
@@ -987,7 +1329,7 @@ In Spring Data Redis 3.2.3, the mapping is:
 - `geo.radius()` + `Circle` + `GeoRadiusCommandArgs` → **deprecated**, maps to `GEORADIUS`
 - `geo.search()` + `RadiusShape` + `GeoSearchCommandArgs` → **current**, maps to `GEOSEARCH`
 
-### 10.5 PostGIS `&&` and the Dual-Filter Pattern
+### 11.5 PostGIS `&&` and the Dual-Filter Pattern
 
 Every PostGIS spatial query uses a **two-step** filter:
 
@@ -1003,7 +1345,35 @@ Step 2: Exact geometry test (expensive)
 
 This pattern exists because exact spatial predicates (`ST_DWithin`, `ST_Within`) are computationally expensive. The index narrows the working set to a few hundred rows at most; the exact test runs on a tiny fraction of the table. Index operators like `&&` are called **lossy** — they accept false positives but no false negatives.
 
-### 10.6 SRID and Coordinate System Pitfalls
+### 11.6 GIN Write Amplification and Mitigation
+
+GIN's write cost is higher than GiST because every `INSERT`/`UPDATE` must add the row to a posting list for every *element* in the new value:
+
+```
+A single restaurant row update with 4 menu items might add:
+  4 item names × ~6 lexemes each  = 24 GIN FTS entries
+  4 dietary arrays × 2 values     = 8 GIN JSONB entries
+  Total: ~32 GIN posting list updates per row update
+```
+
+**Mitigation strategies:**
+
+1. **Pending list** (built-in): GIN writes new entries to a small in-heap pending list first. The main GIN structure is updated asynchronously by `VACUUM` or `gin_clean_pending_list`. This amortizes write cost at the expense of slightly slower reads until the pending list is flushed.
+
+2. **`fastupdate` storage parameter**: Controls the pending list behavior.
+   ```sql
+   CREATE INDEX ... USING GIN(menu) WITH (fastupdate = on);  -- default
+   CREATE INDEX ... USING GIN(menu) WITH (fastupdate = off); -- disable pending list
+   ```
+   Use `fastupdate=off` only when writes are rare and you need consistently fast reads.
+
+3. **Pre-computed tsvector column**: The `menu_search_vector` approach in this project avoids re-parsing the menu text on every read. The tsvector is computed once on write and stored — keeping reads O(1) at the cost of a storage column.
+
+4. **Partial GIN indexes** (advanced): Index only a subset of rows or documents where FTS is needed, reducing the posting list size.
+
+---
+
+### 11.7 SRID and Coordinate System Pitfalls
 
 Common bugs:
 - **Mixed SRIDs:** `ST_DWithin(geom_4326, geom_4269, 8000)` silently produces wrong results if SRIDs differ

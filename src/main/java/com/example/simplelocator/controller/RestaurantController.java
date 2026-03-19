@@ -2,6 +2,8 @@ package com.example.simplelocator.controller;
 
 import com.example.simplelocator.dto.DebugInfoDto;
 import com.example.simplelocator.dto.LocationRequest;
+import com.example.simplelocator.dto.MenuSearchRequest;
+import com.example.simplelocator.dto.MenuSearchResponse;
 import com.example.simplelocator.dto.SearchResult;
 import com.example.simplelocator.service.RestaurantService;
 import lombok.RequiredArgsConstructor;
@@ -75,5 +77,23 @@ public class RestaurantController {
     @PostMapping("/search/debug")
     public ResponseEntity<DebugInfoDto> debugInfo(@RequestBody LocationRequest req) {
         return ResponseEntity.ok(restaurantService.getDebugInfo(req));
+    }
+
+    /**
+     * Combined GIS + GIN (full-text search) + GIN (JSONB) query.
+     * Finds restaurants within 5 miles matching a text query on menu items,
+     * optionally filtered by dietary preference — all in one SQL statement
+     * using three different PostgreSQL index types simultaneously.
+     *
+     * POST body:
+     * {
+     *   "latitude": 40.7128, "longitude": -74.0060,
+     *   "query": "pasta",
+     *   "dietary": "vegetarian"   // optional: vegetarian, vegan, gluten-free, halal, kosher
+     * }
+     */
+    @PostMapping("/search/menu")
+    public ResponseEntity<MenuSearchResponse> searchMenu(@RequestBody MenuSearchRequest req) {
+        return ResponseEntity.ok(restaurantService.searchMenu(req));
     }
 }
